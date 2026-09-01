@@ -17,6 +17,9 @@ from simplex_thought_field import (
     SimplexField,
     ThoughtModulator,
     ThoughtTrace,
+    clear_request_seed,
+    request_seed,
+    set_request_seed,
     snoise2,
     snoise3,
 )
@@ -32,6 +35,8 @@ class DemoConfig:
     hidden_act = "silu"
     rms_norm_eps = 1e-6
     dtype = None
+    # stub: the released layer reads config.layer_types[layer_idx]
+    layer_types = ["linear_attention"] * 64
 
 
 # -- noise ------------------------------------------------------------------
@@ -128,6 +133,75 @@ def test_modulator_replay_and_trace():
     assert torch.equal(tr2.coords, tr.coords)
     for k, v in tr.slot_values.items():
         assert torch.equal(tr2.slot_values[k], v)
+
+
+# -- per-request (thread-local) seed context --------------------------------
+
+
+def test_field_explicit_seed_matches_buffer():
+    """``field(x, seed=S)`` must equal the buffer-based evaluation for seed S."""
+    torch.manual_seed(3)
+    f = SimplexField(seed=0, dim=3)
+    x = torch.randn(4, 11, 3)
+    for s in (0, 1, 42, 98765):
+        explicit = f(x, seed=s)
+        f.seed_offset.copy_(SimplexField._make_seed_offset(s, 3))
+        buffer = f(x)
+        assert torch.equal(explicit, buffer), f"seed {s} mismatch"
+
+
+def test_modulator_thread_local_seed_isolation():
+    """Two threads each get their own seed's field, concurrently, exactly."""
+    import threading
+
+    torch.manual_seed(0)
+    m = ThoughtModulator(hidden_size=32, num_heads=4, seed=0)
+    x = torch.randn(1, 8, 32)
+
+    # reference: single-threaded evaluation with each seed set globally
+    ref = {}
+    for s in (42, 7):
+        m.set_seed(s)
+        ref[s] = {slot: m.slot_bias(x, slot) for slot in ("b", "a")}
+
+    results: dict = {}
+
+    def worker(s):
+        set_request_seed(s)
+        try:
+            results[s] = {slot: m.slot_bias(x, slot).clone() for slot in ("b", "a")}
+        finally:
+            clear_request_seed()
+
+    barrier = threading.Barrier(2)
+
+    def thread(s):
+        worker(s)
+        barrier.wait()  # force the two evaluations to actually overlap
+
+    ts = [threading.Thread(target=thread, args=(s,)) for s in (42, 7)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+
+    for s in (42, 7):
+        for slot in ("b", "a"):
+            assert torch.equal(results[s][slot], ref[s][slot]), (
+                f"thread-local seed {s} slot {slot!r} mismatched reference"
+            )
+
+
+def test_modulator_stateless_interleaved():
+    """Interleaved slot_bias calls on different inputs never return stale data."""
+    torch.manual_seed(0)
+    m = ThoughtModulator(hidden_size=32, num_heads=4, seed=11)
+    x1 = torch.randn(2, 7, 32)
+    x2 = torch.randn(2, 7, 32)
+    # interleave, exactly as concurrent requests would
+    a = m.slot_bias(x1, "b")
+    b = m.slot_bias(x2, "b")
+    c = m.slot_bias(x1, "b")
+    assert torch.equal(a, c), "re-evaluation of the same input drifted (stale cache)"
+    assert not torch.equal(a, b), "two different inputs gave identical bias"
 
 
 # -- layer integration ------------------------------------------------------

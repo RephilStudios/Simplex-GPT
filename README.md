@@ -26,22 +26,35 @@ recorded as a compact, verifiable, replayable _trace_.
 
 ## File map
 
-| File                                                      | Purpose                                                                                                                                                                                                                                                                     |
-| --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `modeling_qwen3_5.py`                                     | The base `Qwen3_5GatedDeltaNet` layer (copied from Hugging Face Transformers, self-contained — no `transformers` import needed).                                                                                                                                            |
-| `simplex_thought_field.py`                                | `snoise2` / `snoise3` (vectorized, differentiable Gustavson simplex), `SimplexField` (seeded + optional fbm), `ThoughtModulator` (latent→field map, slot injection, traces), `ThoughtTrace` (record / JSON / fingerprint / replay).                                         |
-| `simplex_gated_delta_net.py`                              | `SimplexGatedDeltaNet` — drop-in upgrade of the base layer that injects the field into `in_proj_b` (write gain) and `in_proj_a` (decay) via `ThoughtBiasWrapper`, **without duplicating the parent `forward`**. Includes `load_base_state_dict` for pretrained checkpoints. |
-| `test_simplex_thought_field.py`                           | Standalone test suite (no pytest). 11 tests.                                                                                                                                                                                                                                |
-| `demo_thought_patterns.py`                                | End-to-end demonstration with 8 checks + ASCII "ridge" of a thought wave. Writes `thought_trace.json`.                                                                                                                                                                      |
-| `llm_thought.py`                                          | A complete tiny causal LM (embedding → 3 × GatedDeltaNet decoder layers → LM head) with an autoregressive `generate()` loop that exercises the real conv/recurrent cache — the vehicle for LLM-level testing.                                                               |
-| `serve_endpoint.py`                                       | OpenAI-compatible endpoint (FastAPI) serving the Tiny Thought LM: `/v1/completions`, `/v1/models`, `/health`, `/thought/last`. Per-request `thought_seed` override.                                                                                                         |
-| `test_endpoint.py`                                        | LLM-endpoint test suite: spawns thought-on and vanilla servers, runs 7 behavioral tests over HTTP, verifies trace fingerprints client-side.                                                                                                                                 |
-| `tokenizer.py`                                            | Char-level tokenizer for Python source (vocab built from the corpus; encode/decode; JSON save/load).                                                                                                                                                                        |
-| `python_corpus.py`                                        | Synthetic Python coding corpus generator (valid, consistent snippets, heavily hello-world-biased; deterministic).                                                                                                                                                           |
-| `train_slm.py`                                            | Trains a tiny Python coding model (SLM) from scratch on the corpus; saves `slm_weights.pt` + `tokenizer.json`; prints hello-world generation tests.                                                                                                                         |
-| `test_coding_endpoint.py`                                 | Coding-endpoint test suite: serves the trained model, shows it writing real Python and the thought field steering a genuine code choice (6 checks).                                                                                                                         |
-| `slm_weights.pt` / `tokenizer.json` / `python_corpus.txt` | Artifacts produced by `train_slm.py`: trained weights, char vocabulary, and the training corpus.                                                                                                                                                                            |
-| `_diag_noise.py`                                          | Reference-comparison utility: scalar float64 `snoise2`/`snoise3` vs. the vectorized version, plus smoothness stats.                                                                                                                                                         |
+| File                                                                         | Purpose                                                                                                                                                                                                                                                                                                                                                                                             |
+| ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `modeling_qwen3_5.py`                                                        | The base `Qwen3_5GatedDeltaNet` layer (copied from Hugging Face Transformers, self-contained — no `transformers` import needed).                                                                                                                                                                                                                                                                    |
+| `simplex_thought_field.py`                                                   | `snoise2` / `snoise3` (vectorized, differentiable Gustavson simplex), `SimplexField` (seeded + optional fbm, per-evaluation `seed=` override), `ThoughtModulator` (latent→field map, slot injection, traces, **stateless per-thread seed**), `ThoughtTrace` (record / JSON / fingerprint / replay), plus the per-request seed context (`set_request_seed` / `clear_request_seed` / `request_seed`). |
+| `simplex_gated_delta_net.py`                                                 | `SimplexGatedDeltaNet` — drop-in upgrade of the base layer that injects the field into `in_proj_b` (write gain) and `in_proj_a` (decay) via `ThoughtBiasWrapper`, **without duplicating the parent `forward`**. Includes `load_base_state_dict` for pretrained checkpoints.                                                                                                                         |
+| `test_simplex_thought_field.py`                                              | Standalone test suite (no pytest). 14 tests, incl. per-thread seed isolation under parallel threads and stateless interleaving.                                                                                                                                                                                                                                                                     |
+| `demo_thought_patterns.py`                                                   | End-to-end demonstration with 8 checks + ASCII "ridge" of a thought wave. Writes `thought_trace.json`.                                                                                                                                                                                                                                                                                              |
+| `llm_thought.py`                                                             | A complete tiny causal LM (embedding → 3 × GatedDeltaNet decoder layers → LM head) with an autoregressive `generate()` loop that exercises the real conv/recurrent cache — the vehicle for LLM-level testing.                                                                                                                                                                                       |
+| `serve_endpoint.py`                                                          | OpenAI-compatible endpoint (FastAPI) serving the Tiny Thought LM: `/v1/completions`, `/v1/models`, `/health`, `/thought/last`. Per-request `thought_seed` override.                                                                                                                                                                                                                                 |
+| `test_endpoint.py`                                                           | LLM-endpoint test suite: spawns thought-on and vanilla servers, runs 7 behavioral tests over HTTP, verifies trace fingerprints client-side.                                                                                                                                                                                                                                                         |
+| `tokenizer.py`                                                               | Char-level tokenizer for Python source (vocab built from the corpus; encode/decode; JSON save/load).                                                                                                                                                                                                                                                                                                |
+| `python_corpus.py`                                                           | Synthetic Python coding corpus generator (valid, consistent snippets, heavily hello-world-biased; deterministic).                                                                                                                                                                                                                                                                                   |
+| `train_slm.py`                                                               | Trains a tiny SLM from scratch; `--corpus python` (coding model, saves `slm_weights.pt` + `tokenizer.json`, runs hello-world tests) or `--corpus assistant` (prose model, saves `assistant_weights.pt` + `assistant_tokenizer.json`, runs prose tests).                                                                                                                                             |
+| `test_coding_endpoint.py`                                                    | Coding-endpoint test suite: serves the trained model, shows it writing real Python and the thought field steering a genuine code choice (6 checks).                                                                                                                                                                                                                                                 |
+| `slm_weights.pt` / `tokenizer.json` / `python_corpus.txt`                    | Artifacts produced by `train_slm.py --corpus python`: trained weights, char vocabulary, and the training corpus.                                                                                                                                                                                                                                                                                    |
+| `assistant_corpus.py`                                                        | The assistant's own prose, 41 passages (~16k chars), deterministic — the training corpus for the assistant-style SLM.                                                                                                                                                                                                                                                                               |
+| `steer_assistant.py`                                                         | A/B steering demo for the assistant SLM: vanilla vs. thought seeds (42 / 7) on canonical prompts + retraceability check.                                                                                                                                                                                                                                                                            |
+| `probe_steering.py`                                                          | Finds prompts with _genuine choice_: scans corpus prefixes for greedy flips at a given gain, and compares temperature-1.0 samples (vanilla vs. steered).                                                                                                                                                                                                                                            |
+| `assistant_weights.pt` / `assistant_tokenizer.json` / `assistant_corpus.txt` | Artifacts produced by `train_slm.py --corpus assistant` (6.1M params, 4 × 384).                                                                                                                                                                                                                                                                                                                     |
+| `test_real_integration.py`                                                   | Verifies `SimplexGatedDeltaNet` against the _released_ transformers `Qwen3_5GatedDeltaNet`: state-dict keys, forward agreement, `load_base_state_dict` onto real weights, retraceability. `--section a                                                                                                                                                                                              | b`(run`b` in its own process on tight VRAM). |
+| `real_model_steering.py`                                                     | A/B steering demo on the real `Qwen3.5-4B`: wraps all 24 GatedDeltaNet layers in place, compares vanilla vs. per-seed completions, verifies bit-exact unwrap.                                                                                                                                                                                                                                       |
+| `thought_wrap.py`                                                            | Shared in-place Thought Field wrap/unwrap/set_seed for a real transformers model (shared base weights, no duplication).                                                                                                                                                                                                                                                                             |
+| `serve_real_endpoint.py`                                                     | OpenAI-compatible **chat** endpoint for the real model (`/`, `/v1/chat/completions` with `stream` SSE, `/v1/completions`, `/health`, `/thought`); optional `--thought-enabled` with per-request `thought_seed` steering; **concurrent requests** (seed applied thread-locally, no global lock).                                                                                                     |
+| `chat_demo.py`                                                               | Demo client: multi-turn conversation + A/B steering against a running endpoint (or `--spawn` to boot the server itself).                                                                                                                                                                                                                                                                            |
+| `openai_client_demo.py`                                                      | Official `openai` SDK drop-in demo: `models.list()`, chat, streaming, A/B steering via `extra_body={"thought_seed": N}`.                                                                                                                                                                                                                                                                            |
+| `chat_ui.html`                                                               | Tiny web chat page served at `GET /`: live SSE streaming, A/B compare (both panes stream in parallel) with steered/identical verdict.                                                                                                                                                                                                                                                               |
+| `test_real_endpoint.py`                                                      | Spawns the real endpoint (thought on) and checks over HTTP: health, models, chat, retrace (same seed identical), seed routing, state.                                                                                                                                                                                                                                                               |
+| `test_concurrency.py`                                                        | Spawns the real endpoint and proves concurrency: parallel distinct seeds stay isolated, parallel same-seed is retraceable, parallel streams agree with non-stream, and parallel wall time genuinely overlaps (7 checks).                                                                                                                                                                            |
+| `_diag_noise.py`                                                             | Reference-comparison utility: scalar float64 `snoise2`/`snoise3` vs. the vectorized version, plus smoothness stats.                                                                                                                                                                                                                                                                                 |
 
 ---
 
@@ -50,7 +63,7 @@ recorded as a compact, verifiable, replayable _trace_.
 Requires Python 3.12 + PyTorch (CPU is fine for these sizes).
 
 ```bash
-# test suite (11/11)
+# test suite (14/14)
 python test_simplex_thought_field.py
 
 # end-to-end demo (8 checks; writes thought_trace.json)
@@ -123,6 +136,43 @@ how sharp the model's distribution is at each step:
 In short: the thought field is a smooth, seedable modulation of the model's
 decisions, strongest where the model has real uncertainty, and harmless where
 the model is confidently correct.
+
+## Training the assistant-prose SLM (natural-language test)
+
+The same pipeline can train a tiny model **on the assistant's own prose**
+(`assistant_corpus.py`, 41 passages, ~16k chars) — a higher-entropy,
+natural-language test of the architecture:
+
+```bash
+# train (6.1M params, 4 layers x 384 hidden)
+python train_slm.py --corpus assistant --steps 6000 --hidden 384 --layers 4 --device cuda
+#    -> assistant_weights.pt, assistant_tokenizer.json, assistant_corpus.txt
+#    best loss 0.2077 nats/token (perplexity ~1.23)
+
+# A/B steering demo (vanilla vs. thought seeds 42 / 7 + retrace check)
+python steer_assistant.py --device cuda
+
+# find where the model has genuine choice (greedy flips + temperature-1.0 samples)
+python probe_steering.py --gain 2.0 --device cuda
+```
+
+### What the steering demo shows (gain 2.0)
+
+- **Memorized continuations resist the field.** The canonical prompts
+  complete to exact corpus sentences (e.g. `The core idea is that ` →
+  `instead of per-token randomness, a single seeded`) — greedy output is
+  identical for seed 42, seed 7, and vanilla. Retraceability (same seed twice
+  → bit-identical output) holds everywhere.
+- **Genuine choices steer.** Scanning 300 corpus prefixes, the thought field
+  flips the greedy completion on **42/300**, changing specific word choices:
+  `a small project` → `a small corpus`, `layer updates` → `layer, and fin…`,
+  and even fixing a memorized typo: `whes l` → `whose`.
+- **Sampling makes it more visible.** At temperature 1.0 the field shifts the
+  distribution enough that 2/4 canonical prompts sample differently per seed.
+
+Same honest conclusion as the coding model: the field is a seedable,
+retraceable choice knob — strongest where the model has real uncertainty,
+harmless where the model is confidently correct.
 
 ---
 
@@ -306,27 +356,121 @@ applies directly (see below).
 
 ## Using it with a real Qwen3.5 checkpoint
 
-The local environment currently has `transformers==4.44` (pre-Qwen3.5) and no
-cached checkpoint, so the endpoint demo uses the tiny LM above. To run it on
-the real model once network + a newer `transformers` are available, the
-pattern is a post-load surgery (no retraining, no architecture changes):
+This is now **implemented and verified** against `Qwen/Qwen3.5-4B` (a 4B
+hybrid: 24 GatedDeltaNet layers + 8 full-attention layers, bf16).
 
-```python
-from transformers import AutoConfig, AutoModelForCausalLM
-from modeling_qwen3_5 import Qwen3_5GatedDeltaNet
-from simplex_gated_delta_net import SimplexGatedDeltaNet
+### Environment (Windows / RTX 3060 12 GB)
 
-config = AutoConfig.from_pretrained("your/qwen3.5")
-model = AutoModelForCausalLM.from_pretrained("your/qwen3.5")
+`transformers==5.16` (has `models.qwen3_5`), `accelerate==1.14`, and
+`torchvision==0.20.1` + `torchaudio==2.5.1` matched to `torch 2.5.1`. Two
+Windows quirks hit and worked around:
 
-# find every GatedDeltaNet in the decoder and swap it for the thought version
-for name, mod in list(model.named_modules()):
-    if type(mod) is Qwen3_5GatedDeltaNet:
-        parent, attr = _parent_of(model, name)
-        new = SimplexGatedDeltaNet(config, mod.layer_idx,
-                                   thought={"seed": 42, "gain_b": 0.25, "gain_a": 0.25})
-        new.load_base_state_dict(mod.state_dict())   # remaps in_proj_a/b.* -> .base.*
-        setattr(parent, attr, new)
+- `device_map="cuda"` **segfaults** (accelerate dispatch on this stack) — load
+  on CPU then `.to("cuda")` instead.
+- the CUDA allocator intermittently reports "N free, can't place M" (fragmentation);
+  `PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512` (set in the scripts) fixes it.
+
+### Integration test (`test_real_integration.py`)
+
+| Check                                                 | Result                                                |
+| ----------------------------------------------------- | ----------------------------------------------------- |
+| state-dict keys, released vs wrapped                  | identical (9/9)                                       |
+| forward, released vs wrapped (random init)            | max diff **0.0** (bit-exact)                          |
+| `load_base_state_dict` onto real weights              | 2 remapped `.base.` + 15 `thought.*`, values verified |
+| wrapped-off layer vs released layer, **real weights** | max diff **0.0** (bit-exact)                          |
+| retraceability on GPU                                 | same seed identical, different seed differs           |
+
+`SimplexGatedDeltaNet` subclasses the **released** `Qwen3_5GatedDeltaNet`
+(local `modeling_qwen3_5.py` is the fallback when `transformers` is absent), so
+a thought-disabled layer is bit-exact with the official model by construction.
+
+### Steering the real model (`real_model_steering.py`)
+
+Wraps all 24 GatedDeltaNet layers **in place** (shared base weights — only the
+small `thought.*` modules are added), runs vanilla + per-seed greedy
+completions, then unwraps and verifies the baseline is restored bit-exactly.
+
+| Gain | prompts steered (4 choice prompts)                                    |
+| ---- | --------------------------------------------------------------------- |
+| 1.0  | 0/4                                                                   |
+| 2.0  | 0/4                                                                   |
+| 4.0  | 1/4 — `Beagle` → `Poodle` (seed 7)                                    |
+| 8.0  | 2/4 — `Beagle` → `Poodle`/`Labrad` (seed-dependent); artifacts appear |
+
+On a confident 4B model the field needs more gain than on the tiny SLM, and it
+still lands **only** on the prompt with genuine choice (dog breed), while the
+near-deterministic color/city/sound prompts resist even gain 8 — the same
+"inversely proportional to confidence" behavior, confirmed on a real
+checkpoint. Retraceability and clean unwrap **PASS** at every gain.
+
+Run:
+
+```bash
+python test_real_integration.py --weights models/Qwen3.5-4B   # or --section a|b
+python real_model_steering.py --gain 4.0 --seeds 42 7
+```
+
+### Chat endpoint (`serve_real_endpoint.py`)
+
+OpenAI-compatible chat over the real model, with optional thought-field
+steering (per-request `thought_seed`) and **SSE streaming** ("stream": true).
+
+**Concurrency:** requests are not serialized. Each request's seed is applied
+in a thread-local context (`set_request_seed`), and the thought modulator is
+stateless per evaluation, so overlapping chats each get their own seed —
+including streamed ones, whose `generate()` runs on its own worker thread.
+Retraceability holds under concurrency: two simultaneous same-seed requests
+return identical text (verified by `test_concurrency.py`).
+
+```bash
+# thought field on (A/B steering available per request)
+python serve_real_endpoint.py --port 8100 --weights models/Qwen3.5-4B \
+    --thought-enabled --gain 4.0
+
+# chat (OpenAI format)
+curl -s http://127.0.0.1:8100/v1/chat/completions -H 'Content-Type: application/json' \
+    -d '{"messages": [{"role": "user", "content": "Pick a color. One word."}],
+         "max_tokens": 16, "thought_seed": 42}'
+
+# same message, different seed -> different retraceable choice
+... -d '{..., "thought_seed": 7}'
+
+# demo client (multi-turn + A/B; --spawn boots the server itself)
+python chat_demo.py --port 8100
+```
+
+### Web UI
+
+The endpoint also serves a tiny self-contained chat page at **`/`** (same
+origin, no CORS). Start the server, then open `http://127.0.0.1:8100/` in a
+browser. It has a normal **Send** (plain reply, **streams tokens live** via
+SSE) and an **A/B** button that answers the same message under two
+configurable thought seeds — **both panes stream in parallel** — flagging
+when the seed steered the choice. Verified: `GET /` serves the page; A/B
+through the UI path returns seed-dependent replies (seed 42 `Beagle` vs
+seed 7 `Poodle`).
+
+Verified: multi-turn context carries over; same seed + same messages =>
+bit-identical reply; `seed 42 -> Poodle`, `seed 7 -> Labrad` on the
+genuine-choice prompt.
+
+### Concurrency (`test_concurrency.py`)
+
+Requests are **not** serialized: each one's `thought_seed` is applied in a
+thread-local context and the thought modulator keeps no cross-request state,
+so overlapping chats (streamed or not) are isolated per thread. The suite
+proves it over HTTP against the real endpoint:
+
+| Check                                                                                | Result                        |
+| ------------------------------------------------------------------------------------ | ----------------------------- |
+| parallel chats with seeds 42 / 7 / 123 — all non-empty                               | PASS                          |
+| parallel chats: each request's seed echoed back                                      | PASS (no cross-contamination) |
+| parallel chats with the _same_ seed → identical text                                 | PASS (retraceable in flight)  |
+| parallel _streamed_ chats, same seed → identical, and equal to the non-stream result | PASS                          |
+| parallel wall time < sequential sum (ratio 0.97)                                     | PASS (genuinely overlapping)  |
+
+```bash
+python test_concurrency.py --weights models/Qwen3.5-4B --gain 4.0
 ```
 
 `load_base_state_dict` bridges the pretrained weights onto the wrapped layout;

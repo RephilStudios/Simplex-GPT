@@ -29,7 +29,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from modeling_qwen3_5 import Qwen3_5GatedDeltaNet
+from modeling_qwen3_5 import (
+    Qwen3_5GatedDeltaNet,  # noqa: F401  (local fallback, used by tests)
+)
+
+try:  # released layer (single source of truth — same as the real endpoint)
+    from transformers.models.qwen3_5.modeling_qwen3_5 import (
+        Qwen3_5GatedDeltaNet as ReleasedGatedDeltaNet,
+    )
+
+    _ReleasedGatedDeltaNet = ReleasedGatedDeltaNet
+except Exception:  # pragma: no cover - transformers too old / absent
+    _ReleasedGatedDeltaNet = Qwen3_5GatedDeltaNet
+
 from simplex_gated_delta_net import SimplexGatedDeltaNet
 
 
@@ -50,6 +62,8 @@ class LMConfig:
     hidden_act = "silu"
     rms_norm_eps = 1e-6
     dtype = None
+    # stub: the released layer reads config.layer_types[layer_idx]
+    layer_types = ["linear_attention"] * 64
 
 
 class RMSNorm(nn.Module):
@@ -83,7 +97,10 @@ class MLP(nn.Module):
 
 
 class DeltaCache:
-    """Minimal cache protocol expected by :class:`Qwen3_5GatedDeltaNet`."""
+    """Legacy cache protocol (old local-layer forward).  Unused now that the
+    tiny LM runs on the released layer + transformers ``DynamicCache`` —
+    kept only so older scripts that imported it keep working.
+    """
 
     def __init__(self, num_layers: int):
         self.conv_states: list = [None] * num_layers
@@ -101,18 +118,21 @@ class TinyDecoderLayer(nn.Module):
         if thought is not None:
             self.linear_attn = SimplexGatedDeltaNet(config, layer_idx, thought=thought)
         else:
-            self.linear_attn = Qwen3_5GatedDeltaNet(config, layer_idx)
+            self.linear_attn = _ReleasedGatedDeltaNet(config, layer_idx)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.mlp = MLP(config)
 
     def forward(
         self, hidden_states, cache_params=None, cache_position=None, attention_mask=None
     ):
+        # The released Qwen3_5GatedDeltaNet.forward signature is
+        # (hidden_states, cache_params, attention_mask, **kwargs) — it has no
+        # cache_position parameter (the conv/recurrent cache is position-
+        # agnostic), so it is deliberately not forwarded here.
         hidden_states = hidden_states + self.linear_attn(
             self.input_layernorm(hidden_states),
-            cache_params,
-            cache_position,
-            attention_mask,
+            cache_params=cache_params,
+            attention_mask=attention_mask,
         )
         hidden_states = hidden_states + self.mlp(
             self.post_attention_layernorm(hidden_states)
@@ -146,6 +166,22 @@ class TinyThoughtLM(nn.Module):
     def device(self) -> torch.device:
         return next(self.parameters()).device
 
+    def make_cache(self):
+        """A transformers ``DynamicCache`` with one ``LinearAttentionLayer``
+        per decoder layer — the exact cache the released GatedDeltaNet
+        forward speaks (same construction as ``Qwen3_5ForCausalLM`` from its
+        ``config.layer_types``)."""
+        from transformers.cache_utils import DynamicCache
+
+        class _TextConfig:
+            layer_types = ["linear_attention"] * len(self.layers)
+            number_of_conv_states = 1
+
+            def get_text_config(self, decoder: bool = False):
+                return self
+
+        return DynamicCache(config=_TextConfig())
+
     def forward(self, input_ids, cache_params=None, cache_position=None):
         h = self.embed(input_ids)
         for layer in self.layers:
@@ -170,7 +206,7 @@ class TinyThoughtLM(nn.Module):
         (seeded multinomial); without ``rng_seed`` it draws from the global RNG.
         """
         assert input_ids.dim() == 2 and input_ids.shape[0] == 1, "batch size must be 1"
-        cache = DeltaCache(len(self.layers))
+        cache = self.make_cache()
         device = input_ids.device
         history = input_ids[0].tolist()
         cur = input_ids

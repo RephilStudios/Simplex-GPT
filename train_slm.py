@@ -2,20 +2,21 @@
 train_slm.py
 ============
 
-Train a tiny Python coding model (SLM) from scratch on the synthetic Python
-corpus, then show it producing ``hello world`` and (optionally) that the
-thought field can steer the *real* code output.
+Train a tiny language model (SLM) from scratch, then show it generating.
+
+Two corpori are supported:
+  * ``python``    - synthetic Python; the target is ``print("hello world")``.
+  * ``assistant`` - the assistant's own prose; the target is fluent, on-style
+                    text (a higher-entropy, natural-language test of the arch).
 
 Run::
 
-    python train_slm.py                     # sensible defaults
-    python train_slm.py --steps 8000 --hidden 320 --layers 4
-    python train_slm.py --snippets 60000 --seq-len 64 --lr 2e-3
+    python train_slm.py --corpus python                # coding SLM
+    python train_slm.py --corpus assistant --steps 6000 --hidden 384 --layers 4
 
-Artifacts (written to the project dir):
-    slm_weights.pt     trained vanilla weights
-    tokenizer.json     char vocabulary
-    python_corpus.txt  the corpus that was trained on (for reference)
+Artifacts (written to the project dir): named per corpus by default,
+``slm_weights.pt`` + ``tokenizer.json`` for python, ``assistant_weights.pt`` +
+``assistant_tokenizer.json`` for assistant.
 """
 
 from __future__ import annotations
@@ -26,13 +27,15 @@ import time
 import torch
 import torch.nn.functional as F
 
+from assistant_corpus import build_corpus as build_assistant_corpus
 from llm_thought import LMConfig, TinyThoughtLM
-from python_corpus import build_corpus
+from python_corpus import build_corpus as build_python_corpus
 from tokenizer import CharTokenizer
 
 
 def parse_args():
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--corpus", default="python", choices=["python", "assistant"])
     ap.add_argument("--snippets", type=int, default=40000)
     ap.add_argument("--steps", type=int, default=4000)
     ap.add_argument("--batch", type=int, default=16)
@@ -46,11 +49,18 @@ def parse_args():
         "--device", default=None, help="cpu|cuda (default: cuda if available)"
     )
     ap.add_argument("--log-every", type=int, default=500)
-    ap.add_argument("--out", default="slm_weights.pt")
-    ap.add_argument("--tokenizer-out", default="tokenizer.json")
-    ap.add_argument("--corpus-out", default="python_corpus.txt")
     ap.add_argument("--no-save", action="store_true")
-    return ap.parse_args()
+    args = ap.parse_args()
+    # per-corpus artifact names (unless the caller overrides them)
+    if args.corpus == "assistant":
+        args.out = "assistant_weights.pt"
+        args.tokenizer_out = "assistant_tokenizer.json"
+        args.corpus_out = "assistant_corpus.txt"
+    else:
+        args.out = "slm_weights.pt"
+        args.tokenizer_out = "tokenizer.json"
+        args.corpus_out = "python_corpus.txt"
+    return args
 
 
 def make_config(args):
@@ -80,6 +90,26 @@ def hello_tests(model: TinyThoughtLM, tok: CharTokenizer) -> bool:
     return hit
 
 
+@torch.no_grad()
+def prose_tests(model: TinyThoughtLM, tok: CharTokenizer) -> bool:
+    """Complete a few assistant-style prompts and show the model's voice."""
+    prompts = [
+        "The core idea is that ",
+        "Let me be honest about ",
+        "One thing to flag. ",
+        "The result is ",
+    ]
+    print("\n--- assistant-style generation (greedy) ---")
+    ok = False
+    for p in prompts:
+        out = model.generate_text(p, tok, max_new_tokens=40)
+        letters = sum(c.isalpha() for c in out)
+        good = len(out) > 0 and letters >= max(8, int(0.4 * len(out)))
+        ok = ok or good
+        print(f"[{'ok' if good else '  '}] {p!r}\n       -> {out!r}")
+    return ok
+
+
 def main():
     args = parse_args()
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -87,7 +117,10 @@ def main():
 
     # -- data ----------------------------------------------------------------
     t0 = time.time()
-    corpus, n_snip = build_corpus(n_snippets=args.snippets, seed=args.seed)
+    if args.corpus == "assistant":
+        corpus, n_snip = build_assistant_corpus()
+    else:
+        corpus, n_snip = build_python_corpus(n_snippets=args.snippets, seed=args.seed)
     tok = CharTokenizer.from_text(corpus)
     data = torch.tensor(tok.encode(corpus), dtype=torch.long)
     n = data.numel()
@@ -148,9 +181,18 @@ def main():
         torch.save(model.state_dict(), args.out)
         print(f"saved weights -> {args.out}\nsaved tokenizer -> {args.tokenizer_out}")
 
-    hit = hello_tests(model, tok)
-    print(f"\nhello-world: {'PASS' if hit else 'not yet (try more steps / capacity)'}")
-    return 0 if hit else 1
+    if args.corpus == "python":
+        hit = hello_tests(model, tok)
+        print(
+            f"\nhello-world: {'PASS' if hit else 'not yet (try more steps / capacity)'}"
+        )
+        return 0 if hit else 1
+
+    ok = prose_tests(model, tok)
+    print(
+        f"\nassistant-style: {'looks fluent' if ok else 'still rough (try more steps / data)'}"
+    )
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

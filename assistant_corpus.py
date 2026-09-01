@@ -1,0 +1,344 @@
+"""
+assistant_corpus.py
+===================
+
+A corpus of assistant-style output — the register this model is meant to
+mimic. It is authored in the assistant's own voice: direct technical
+explanations, honest caveats, structured lists, code, test-result summaries,
+and offers to continue. This is what "training on my own output" means here:
+a natural-language distribution (much higher entropy than the repetitive
+Python corpus) so the tiny GatedDeltaNet LM is tested on realistic prose.
+
+The passages below are a representative sample of the assistant's actual
+response style from working sessions (explanations, results, design rationale,
+debugging narratives, and follow-up offers).
+"""
+
+from __future__ import annotations
+
+PASSAGES: list[str] = [
+    """
+Short answer: yes, but with a catch. The decoder is a GatedDeltaNet linear-
+attention layer, not standard self-attention, so it can only accept weights
+whose architecture matches. A Llama or GPT-2 checkpoint will not load: the
+state-dict keys like in_proj_qkv, in_proj_a, in_proj_b, A_log, dt_bias and
+conv1d are specific to this layer, and the shapes will not line up. It is a
+hard mismatch, not a reshape problem. There are two real paths: load matching
+open weights from a Qwen3.5-class hybrid model, or train the tiny model from
+scratch on a small corpus. The second path is fully offline and fast on a
+modern GPU.
+""",
+    """
+All green. Let me clear the regenerated logs. Every suite passed: the unit
+tests, the layer demo, and both endpoint suites. The only non-fatal noise in
+the output is a benign PyTorch buffer warning, which we copy immediately, and
+the expected fast-path-unavailable line, since the optional kernels are not
+installed. Everything is reproducible by running the test scripts in order.
+""",
+    """
+Let me be honest about what this will and will not do. A two-megaparameter
+character-level model will not write perfect prose. It will learn the
+statistics of the text: the common phrases, the typical sentence shapes, the
+way a technical explanation tends to flow. The goal is not a fluent model;
+the goal is to test the architecture. If the GatedDeltaNet decoder can learn
+a real language distribution from scratch, that is strong evidence the layer
+is a reasonable building block.
+""",
+    """
+The core idea is that instead of per-token randomness, a single seeded,
+differentiable noise field is sampled at coordinates that are a smooth,
+learnable function of the hidden state and time. Because the field is a pure
+function of the hidden states, the time index, the seed, and the weights, and
+it contains no randomness in the forward pass, every pattern is fully
+reproducible and can be recorded as a compact, verifiable trace.
+""",
+    """
+Honest caveat: a well-trained model is confident, so the effect of the field
+depends on how sharp the distribution is at each step. Where the answer is
+memorized, even a large gain will not override it, which is the desired
+behavior. Where there is a genuine choice among several valid continuations,
+the seed steers the model to a different valid option. In short, the field is
+a seedable choice knob on the model's true uncertainties, and it is harmless
+where the model is confidently correct.
+""",
+    """
+Found it. This is a classic indexing bug. The logits tensor has shape batch,
+sequence, vocabulary. Indexing it with a colon, minus one, and zero selects
+the batch, the last timestep, and vocabulary index zero. That returns a single
+number, the logit for token zero, not the full distribution. Taking the argmax
+of a one element tensor always returns zero, so every generated token was
+silently collapsed to id zero. The fix is to index the last timestep and keep
+the full vocabulary axis.
+""",
+    """
+The plan is simple. First, build a character-level tokenizer tuned to the
+corpus, so the vocabulary only contains characters that actually appear.
+Second, generate a consistent, repetitive corpus so a small model can learn it.
+Third, add a training loop with a cross-entropy next-token objective and an
+Adam optimizer. Fourth, save the weights and the tokenizer, and show the model
+completing a prompt. The whole thing runs offline and finishes in a few
+minutes.
+""",
+    """
+Let me trace through what happens during generation. At each step the model
+takes the current token, runs it through the embedding, then through each
+decoder layer, and finally through the language model head to get a
+distribution over the next token. The decoder layer updates a recurrent state
+and a convolution state, so decoding is incremental and does not recompute the
+whole prefix. This is the same cache protocol the real model uses, token by
+token.
+""",
+    """
+Two things to verify before I commit to an approach. First, does the
+checkpoint use the same linear-attention layer, with the same submodules and
+the same head dimensions? Second, is it the full model, with embeddings and a
+language model head, or just a single layer? The first question determines
+whether the weights can load at all, and the second determines whether you
+get a usable language model or just one block.
+""",
+    """
+The training loss fell steadily from about zero point six to about zero point
+three nats per token over five thousand steps. The perplexity is around one
+and a half, which for a tiny character model on a repetitive corpus means it
+has largely memorized the distribution. Generation on the target prompt now
+produces the expected statement reliably, and the behavior is deterministic
+under greedy decoding.
+""",
+    """
+Want me to push it further? I can expand the corpus for richer output, add a
+small prompt format so it can take a one line specification and complete a
+short program, or wire the model into the endpoint so you can poke it with
+HTTP requests and compare seeds side by side. Each of these is a small,
+self contained change.
+""",
+    """
+The difference between the two servers is only the thought field. Same
+weights, same prompt, same decoding. The vanilla server produces one
+completion, and the thought server, with a different seed, produces a
+different but equally valid completion. That is the whole point: the field is
+not a fixed offset, it is a seedable modulation of the model's decisions.
+""",
+    """
+Let me confirm the setup before running anything. The device is a modern
+discrete GPU, the framework reports the expected version, and the optional
+fast kernels are not present, so the pure torch path will be used. That is
+fine for these model sizes. I will run the tests on the GPU and fall back to
+the CPU if there is any nondeterminism.
+""",
+    """
+One thing to flag. The tokenizer file is treated as a build artifact and is
+ignored by version control, but it is required to serve the model. It is
+regenerated by the training script, so that is fine for a development
+repository. If you want to ship a ready to serve checkpoint without forcing a
+retrain, you would whitelist those files or add them explicitly.
+""",
+    """
+The architecture is a small causal language model built around the real
+linear-attention decoder. It has an embedding, a stack of decoder blocks, a
+final normalization, and a language model head. Each decoder block applies a
+normalization, the linear-attention layer, another normalization, and a feed
+forward network. The whole thing is only a few million parameters, which is
+enough to learn a small distribution but small enough to train in minutes.
+""",
+    """
+Let me summarize the result. The model now produces real, correct output on
+the target prompt, and it is deterministic. The thought field is wired in and
+functional: it changes the internal computation, and where the model has a
+genuine choice it steers the outcome by seed. The fingerprint of each thought
+pattern is recorded and verifies independently. That is the full loop working.
+""",
+    """
+There is a subtle point worth calling out. The modulation is added to two
+internal dynamics of the layer, the write gain and the decay. It is not added
+to the final logits. So its effect is indirect: it changes how the model reads
+and updates its memory, which in turn changes what it decides to say next.
+That is why the effect is strongest where the decision is close, and nearly
+invisible where the model is certain.
+""",
+    """
+I would not over fit this. A small model trained on a narrow corpus will
+sound very much like that corpus and nothing else. That is acceptable for
+testing the architecture, because the question is whether the layer can learn
+at all, not whether it is a good general model. If you want a general model,
+you need a much larger corpus and many more parameters.
+""",
+    """
+Let me reason about why the loss is where it is. The corpus is highly
+repetitive, so a small model can reach a low loss quickly by learning the
+frequent patterns. That does not mean it understands the text. It means the
+text has low entropy. If you swap in a diverse, natural language corpus, the
+same model will plateau at a much higher loss, and that is expected and fine.
+""",
+    """
+The cleanest way to think about the seed is as a channel selector. With no
+field, the model takes its single most likely path. With the field, the model
+is nudged along a different path through its internal states, and different
+seeds choose different paths. The output changes, but it stays within the
+space of things the model knows how to say. It is steerable, not arbitrary.
+""",
+    """
+Let me reason about the root cause before changing anything. The symptom is
+that the output is always the same token. That points to a collapse somewhere
+between the hidden state and the sampled token. I would check three places in
+order: the logits, to see if they are degenerate; the sampling step, to see if
+an index is wrong; and the cache, to see if a state is being reused in a way
+that freezes the computation. In this case the bug was in the sampling index.
+""",
+    """
+A good commit message describes the change, not the chore. If the subject
+line already says what happened, the body should not repeat it. Use the
+imperative mood, keep the subject short, and only add a body when it explains
+why the change was necessary or how it affects behavior. Otherwise, one clear
+line is enough.
+""",
+    """
+Performance here is not the bottleneck, but it is worth noting. The forward
+pass is dominated by the linear-attention layer, which does a small
+convolution and a recurrence. For the sequence lengths we care about that is
+fast. The batch size and the number of layers matter more than any single
+kernel. If you need more throughput, increase the batch before you touch the
+model shape.
+""",
+    """
+One security point. When you load a saved model, the file format can in
+principle execute code. For files you produced yourself that is a non issue.
+For files from an untrusted source, load them in a restricted mode and treat
+the contents as data, not as instructions. This is a general habit, not
+specific to this project, but it is easy to forget when iterating quickly.
+""",
+    """
+The cleanest API is the one that is hard to misuse. For a completion endpoint,
+that means a small request with a prompt and a few decoding options, and a
+response with the text, the token counts, and any metadata about the thought
+field. Avoid exposing internals the caller does not need. If a parameter is
+rarely used, it should have a sensible default and stay optional.
+""",
+    """
+My testing philosophy for a small project like this is to test behavior,
+not implementation. I would check that the model produces the expected output
+for a known prompt, that it is deterministic, and that the thought field
+changes the output where it should. I would not assert on internal tensor
+shapes or loss values, because those can change as the model improves.
+""",
+    """
+Let me explain how the normalization works, because it matters for stability.
+Before the attention and the feed forward block, the hidden state is
+normalized so its scale is controlled. This keeps the activations in a sane
+range, which makes training more stable and prevents the values from exploding
+or vanishing as they pass through many layers. It is a small piece of code
+with an outsized effect on whether training converges at all.
+""",
+    """
+There are two ways to look at a bug. One is to patch the symptom, which is
+fast but often comes back. The other is to find the root cause and fix it, which
+is slower the first time but prevents the whole class of failure. I would
+always reach for the root cause when I have time, and only patch a symptom when
+I need to unblock something and can leave a clear note about the real issue.
+""",
+    """
+Let me walk through the data flow one more time. The prompt is turned into a
+sequence of characters, then into integer token ids. Those ids are embedded
+into vectors. The vectors pass through the decoder, layer by layer, each layer
+refining the representation. The final layer produces a distribution over the
+vocabulary, and we pick the next token. That token is appended and the process
+repeats until we stop. It is a simple loop, and most bugs live in that loop.
+""",
+    """
+If I had to choose between a bigger model and a better corpus, I would pick the
+corpus, at least to start. A small model trained on a good distribution will
+outperform a bigger model trained on a noisy one, and it will be far cheaper
+to run. Once the data is solid, then it is worth adding parameters and seeing
+whether the model can use them.
+""",
+    """
+The point of a seed in this context is not to get a random result. It is to get
+a different, but reproducible, result. Two runs with the same seed should be
+identical to the last token. Two runs with different seeds should differ, but
+only in the places where the model had a real choice. That combination is what
+makes the field useful as a control, rather than just as noise.
+""",
+    """
+Let me be precise about what deterministic means here. It means that given the
+same weights, the same input, and the same decoding settings, the output is
+bit for bit identical. It does not mean the model is deterministic in general,
+because sampling with a fresh random seed will vary. The guarantee is about
+reproducibility of a fixed configuration, which is what you want for testing.
+""",
+    """
+A reasonable deployment for a model this size is a single small server process
+that loads the weights once and then serves completions over HTTP. You do not
+need a cluster or a special runtime. The main things to get right are keeping
+the model in memory, handling a handful of concurrent requests, and returning
+clean errors when the input is malformed.
+""",
+    """
+Let me summarize the tradeoff plainly. A small model is cheap, fast, and easy
+to reason about, but it has limited capacity and will sound like its training
+data. A large model is more general and fluent, but it is expensive and harder
+to control. For testing an architecture, the small model is the right tool, and
+its limitations are part of the information you get out of it.
+""",
+    """
+The feed forward network is where a lot of the model's computation happens.
+It expands the hidden state to a wider representation, applies a nonlinearity,
+and projects back. This gives each position a chance to transform its
+representation in a way that depends on the value, not just its position.
+Together with the attention, it is what lets the model do anything beyond
+trivial pattern matching.
+""",
+    """
+If the output is incoherent, I would not jump to conclusions about the
+architecture. I would first check the data, then the training, and only then
+the model. Most incoherence in a tiny model comes from too little data or too
+few steps, not from a broken layer. The layer is either working or it is not,
+and a loss that goes down is a good sign that it is learning.
+""",
+    """
+Let me put the result in context. The model went from producing random
+characters to producing plausible, on topic sentences. That is a real change,
+and it happened with a tiny amount of data and a few minutes of training. For
+the purpose of testing whether this decoder architecture can learn a language
+distribution at all, that is a clear yes.
+""",
+    """
+One more thing about the corpus. Because it is written in a consistent, direct
+style, the model will pick that style up. It will favor short declarative
+sentences, explicit caveats, and concrete examples. That is a feature for this
+test, because it means the generated text is easy to evaluate by eye. If you
+want a different register, you need a corpus in that register.
+""",
+    """
+Let me make sure I am being honest about the limits. This model does not
+reason. It predicts the next character based on what it has seen. Any
+appearance of understanding is an illusion produced by a good distribution. The
+value of the exercise is not that we built a smart assistant, but that we
+verified a building block learns the way we expect it to.
+""",
+    """
+If you want to extend this, the natural next step is to grow the corpus with
+more diverse examples and to add a few more layers. The code is already
+structured so that the number of layers and the hidden size are parameters.
+You do not need to change the training loop or the generation loop, only the
+config and the data. That is the sign of a design that is easy to grow.
+""",
+    """
+Let me close with the practical takeaway. You now have a small, trained model
+that produces text in a consistent style, a way to serve it over HTTP, and a
+seedable field that steers its choices. That is a complete, working system for
+testing the architecture, and every piece of it can be reproduced from the
+repository without any external services.
+""",
+]
+
+
+def build_corpus() -> tuple[str, int]:
+    """Return ``(corpus_text, n_passages)`` joined by blank-line separators."""
+    text = "\n\n".join(p.strip() for p in PASSAGES) + "\n\n"
+    return text, len(PASSAGES)
+
+
+if __name__ == "__main__":
+    text, n = build_corpus()
+    print(f"passages: {n}, chars: {len(text)}")
+    print("--- sample ---")
+    print(text[:600])

@@ -35,6 +35,13 @@ With the thought field enabled, the projection weights live under
 ``in_proj_b.base.*`` / ``in_proj_a.base.*``. Use
 :meth:`SimplexGatedDeltaNet.load_base_state_dict` to load a checkpoint
 trained on the vanilla layer.
+
+Base-class note
+---------------
+When ``transformers`` is installed with the ``qwen3_5`` module, this class
+subclasses the **released** ``Qwen3_5GatedDeltaNet`` (so a thought-disabled
+layer is bit-exact with the official model by construction). The local
+``modeling_qwen3_5.py`` copy is the fallback for environments without it.
 """
 
 from __future__ import annotations
@@ -44,7 +51,12 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 
-from modeling_qwen3_5 import Qwen3_5GatedDeltaNet
+try:  # prefer the released implementation when available
+    from transformers.models.qwen3_5.modeling_qwen3_5 import (
+        Qwen3_5GatedDeltaNet,
+    )
+except Exception:  # noqa: BLE001 - local fallback (transformers too old / absent)
+    from modeling_qwen3_5 import Qwen3_5GatedDeltaNet
 from simplex_thought_field import ThoughtModulator
 
 __all__ = ["ThoughtBiasWrapper", "SimplexGatedDeltaNet"]
@@ -107,7 +119,12 @@ class SimplexGatedDeltaNet(Qwen3_5GatedDeltaNet):
     def load_base_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> None:
         """Load weights from a vanilla :class:`Qwen3_5GatedDeltaNet` checkpoint.
 
-        Missing thought-field keys (``thought.*``) keep their initialization.
+        Handles both layouts: the wrapped one (``in_proj_{a,b}.base.*``) and
+        the disabled passthrough (plain ``in_proj_{a,b}.*``). Missing
+        thought-field keys (``thought.*``) keep their initialization.
         """
-        remapped = self.remap_base_state_dict(state_dict)
+        wrapped = hasattr(self.in_proj_b, "base") or hasattr(self.in_proj_a, "base")
+        remapped = (
+            self.remap_base_state_dict(state_dict) if wrapped else dict(state_dict)
+        )
         self.load_state_dict(remapped, strict=False)

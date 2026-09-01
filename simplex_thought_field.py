@@ -51,6 +51,7 @@ import base64
 import hashlib
 import json
 import math
+import threading
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Union
 
@@ -63,7 +64,39 @@ __all__ = [
     "SimplexField",
     "ThoughtModulator",
     "ThoughtTrace",
+    "set_request_seed",
+    "clear_request_seed",
+    "request_seed",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Per-request (thread-local) seed context
+# ---------------------------------------------------------------------------
+#
+# Historically the active seed was shared mutable module state, so a server
+# had to serialize every request behind one lock.  The effective field seed
+# is now resolved *per thread* at evaluation time: each request (or the
+# generation thread of a streamed response) carries its own seed in this
+# context, so concurrent requests can each be steered independently without
+# touching the shared buffers.
+_seed_tls = threading.local()
+
+
+def set_request_seed(seed: int) -> None:
+    """Set the thought-field seed for the current thread (per-request)."""
+    _seed_tls.seed = int(seed)
+
+
+def clear_request_seed() -> None:
+    """Drop the thread-local seed so the modulator's own seed is used."""
+    _seed_tls.__dict__.pop("seed", None)
+
+
+def request_seed(default: Optional[int] = None) -> Optional[int]:
+    """The current thread's request seed, or ``default`` if none is set."""
+    s = getattr(_seed_tls, "seed", None)
+    return int(s) if s is not None else default
 
 
 # ---------------------------------------------------------------------------
@@ -296,13 +329,26 @@ class SimplexField(nn.Module):
         gen.manual_seed(int(seed))
         return torch.rand(dim, generator=gen) * 64.0 - 32.0
 
-    def forward(self, coords: torch.Tensor) -> torch.Tensor:
-        """``coords: (..., dim) -> (...,)``"""
+    def forward(self, coords: torch.Tensor, seed: Optional[int] = None) -> torch.Tensor:
+        """``coords: (..., dim) -> (...,)``.
+
+        ``seed`` optionally overrides the field's own seed for this
+        evaluation only (per-request steering without mutating shared
+        state). With ``seed=None`` the registered ``seed_offset`` buffer
+        is used, exactly as before.
+        """
+        offset = (
+            self.seed_offset
+            if seed is None
+            else self._make_seed_offset(seed, self.dim).to(
+                self.seed_offset.device, self.seed_offset.dtype
+            )
+        )
         out: Optional[torch.Tensor] = None
         amp = 1.0
         for o in range(self.octaves):
             scale = 2.0**o
-            c = coords * (self.freq * scale) + self.seed_offset * scale
+            c = coords * (self.freq * scale) + offset * scale
             val = self.noise_fn(c)
             out = val if out is None else out + amp * val
             amp *= self.gain
@@ -474,31 +520,23 @@ class ThoughtModulator(nn.Module):
                     offs.append([phase, phase * 0.5])
         self.register_buffer("slot_offsets", torch.tensor(offs, dtype=torch.float32))
 
-        # Trace bookkeeping (plain attributes, not parameters)
-        self._coords: Optional[torch.Tensor] = None
-        self._slot_values: Dict[str, torch.Tensor] = {}
-        self._coords_key: Optional[tuple] = None
+        # Trace bookkeeping (plain attributes, not parameters).  Written on
+        # every ``slot_bias`` call and read by ``last_trace``.
+        self._last_coords: Optional[torch.Tensor] = None
+        self._last_slot_values: Dict[str, torch.Tensor] = {}
 
     # -- internals ----------------------------------------------------------
 
     def _coords_for(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Field-space coordinates for a ``(B, T, D)`` hidden state.
 
-        Cached per input tensor so the ``"b"`` and ``"a"`` slot lookups in
-        one forward pass share the same computation.
+        Stateless — a pure function of the input tensor and the projection
+        weights — so it is safe to evaluate concurrently from multiple
+        request threads (and free of any cross-step cache staleness).
         """
-        B, T, _ = hidden_states.shape
-        key = (B, T, hidden_states.data_ptr(), self.proj.weight.data_ptr())
-        if self._coords_key == key and self._coords is not None:
-            return self._coords
-
+        T = hidden_states.shape[1]
         t = torch.arange(T, device=hidden_states.device, dtype=hidden_states.dtype)
-        p = self.proj(hidden_states) + t.view(1, T, 1) * self.drift  # (B, T, dim)
-
-        self._coords = p.detach()
-        self._slot_values = {}
-        self._coords_key = key
-        return p
+        return self.proj(hidden_states) + t.view(1, T, 1) * self.drift  # (B, T, dim)
 
     # -- public API ---------------------------------------------------------
 
@@ -517,44 +555,55 @@ class ThoughtModulator(nn.Module):
         H = self.num_heads
         s = self.SLOTS.index(slot)
         off = self.slot_offsets[s * H : (s + 1) * H]  # (H, dim)
-        vals = self.field(p.unsqueeze(2) + off.unsqueeze(0).unsqueeze(0))  # (B, T, H)
-        self._slot_values[slot] = vals.detach()
+        # The current thread's request seed (per-request A/B steering) wins;
+        # otherwise fall back to this modulator's own seed.  Stateless:
+        # no shared buffer is mutated, so concurrent requests are isolated.
+        seed = request_seed(self.seed)
+        vals = self.field(p.unsqueeze(2) + off.unsqueeze(0).unsqueeze(0), seed=seed)
+        self._last_coords = p.detach()
+        self._last_slot_values[slot] = vals.detach()
         gain = self.gain_b if slot == "b" else self.gain_a
         return gain * vals
 
     def set_seed(self, seed: int) -> None:
-        """Change the field seed at runtime (e.g. per-request A/B steering).
+        """Change the modulator's default field seed (global fallback).
 
-        Re-derives the deterministic seed offset and invalidates the
-        coordinate cache so the next forward pass uses the new field.
+        Any per-thread request seed (see :func:`set_request_seed`) still
+        takes precedence while it is set, so this no longer needs to worry
+        about concurrent requests.
         """
         self.seed = int(seed)
         self.field.seed_offset.copy_(SimplexField._make_seed_offset(seed, self.dim))
-        self._coords_key = None
 
-    def replay_slot(self, coords: torch.Tensor, slot: str) -> torch.Tensor:
+    def replay_slot(
+        self, coords: torch.Tensor, slot: str, seed: Optional[int] = None
+    ) -> torch.Tensor:
         """Re-evaluate a slot from recorded coordinates (no hidden state needed).
 
         ``coords`` is the ``(B, T, dim)`` tensor from a
         :class:`ThoughtTrace`. Together with the current weights this
-        reproduces the recorded modulation exactly.
+        reproduces the recorded modulation exactly. Pass ``seed`` to pin the
+        field seed explicitly (e.g. the trace's recorded seed); otherwise
+        the modulator's current default seed is used.
         """
         assert slot in self.SLOTS, f"unknown slot {slot!r}"
         H = self.num_heads
         s = self.SLOTS.index(slot)
-        off = self.slot_offsets[s * H : (s + 1) * H]
-        return self.field(coords.unsqueeze(2) + off.unsqueeze(0).unsqueeze(0))
+        off = self.slot_offsets[s * H : (s + 1) * H]  # (H, dim)
+        return self.field(
+            coords.unsqueeze(2) + off.unsqueeze(0).unsqueeze(0), seed=seed
+        )
 
     def last_trace(self) -> Optional[ThoughtTrace]:
         """The :class:`ThoughtTrace` of the most recent forward pass, if any."""
-        if self._coords is None or not self._slot_values:
+        if self._last_coords is None or not self._last_slot_values:
             return None
         return ThoughtTrace(
             seed=self.seed,
-            batch=self._coords.shape[0],
-            seq_len=self._coords.shape[1],
+            batch=self._last_coords.shape[0],
+            seq_len=self._last_coords.shape[1],
             num_heads=self.num_heads,
-            coords=self._coords.clone(),
-            slot_values={k: v.clone() for k, v in self._slot_values.items()},
-            fingerprint=_fingerprint(self._coords, self._slot_values),
+            coords=self._last_coords.clone(),
+            slot_values={k: v.clone() for k, v in self._last_slot_values.items()},
+            fingerprint=_fingerprint(self._last_coords, self._last_slot_values),
         )

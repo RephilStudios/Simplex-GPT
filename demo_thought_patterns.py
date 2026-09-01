@@ -29,6 +29,8 @@ class DemoConfig:
     hidden_act = "silu"
     rms_norm_eps = 1e-6
     dtype = None
+    # stub: the released layer reads config.layer_types[layer_idx]
+    layer_types = ["linear_attention"] * 64
 
 
 def banner(title: str) -> None:
