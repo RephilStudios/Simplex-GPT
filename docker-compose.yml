@@ -1,0 +1,60 @@
+# Simplex GPT — Qwen3.5-35B-A3B thought-field endpoint on the NVIDIA DGX Spark
+#
+#   docker compose up -d --build          # build + start (35B load is slow)
+#   docker compose logs -f simplex-35b
+#   curl http://localhost:8100/health
+#
+# IDE (OpenAI-compatible):
+#   base_url : http://<spark-ip>:8100/v1
+#   model    : qwen3.5-35b-a3b-simplex
+#   api_key  : anything (no auth on this endpoint)
+#
+# The 35B-A3B weights are host-mounted (NOT baked into the image). Put them at
+# ./models/Qwen3.5-35B-A3B, or set MODEL_PATH in .env.
+#
+# The GPU reservation below uses the Compose-spec `deploy` block (honored by
+# `docker compose` v2). If your tooling instead expects the classic form, swap
+# it for:  runtime: nvidia
+services:
+  simplex-35b:
+    build:
+      context: .
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-nvcr.io/nvidia/pytorch:25.10-py3}
+    image: simplex-gpt-35b-a3b:latest
+    container_name: simplex-35b-a3b
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8100}:8100"
+    volumes:
+      # 35B-A3B weights (large — host-mounted, read-only)
+      - ${MODEL_PATH:-./models/Qwen3.5-35B-A3B}:/models/Qwen3.5-35B-A3B:ro
+      # optional shared HF cache so restarts don't re-fetch tokenizer/processor
+      - ${HF_CACHE:-./hf-cache}:/models/hf
+    environment:
+      - HF_HOME=/models/hf
+      - HF_HUB_DISABLE_PROGRESS_BARS=1
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: >
+      python serve_real_endpoint.py
+      --host 0.0.0.0
+      --port 8100
+      --weights /models/Qwen3.5-35B-A3B
+      --model-id qwen3.5-35b-a3b-simplex
+      --device cuda
+      --thought-enabled
+      --thought-seed 42
+      --gain 2.0
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request as u; u.urlopen(\"http://127.0.0.1:8100/health\", timeout=5)'"]
+      interval: 30s
+      timeout: 15s
+      start_period: 420s   # 35B-A3B first load is slow; give it headroom
+      retries: 5

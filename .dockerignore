@@ -1,0 +1,22 @@
+# keep the image lean — never bake weights, corpora, or caches into the image
+models/
+hf-cache/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.gguf
+assistant_corpus.txt
+python_corpus.txt
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+node_modules/
+.git/
+.gitignore
+.env
+*.log
+_viz_check.js

@@ -1,0 +1,13 @@
+# Runtime deps for the Simplex GPT endpoint (35B-A3B on the DGX Spark).
+#
+# NOTE: torch is inherited from the BASE_IMAGE (a CUDA + PyTorch build for the
+# Spark's aarch64 / Blackwell GPU). We deliberately do NOT pin torch here, or
+# pip may replace/downgrade the GPU build with a CPU wheel.
+transformers>=4.57.0
+tokenizers>=0.20
+huggingface_hub>=0.26
+safetensors>=0.4
+numpy
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7

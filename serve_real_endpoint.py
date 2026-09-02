@@ -67,6 +67,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
+from thought_recorder import (
+    TrajectoryBuffer,
+    clear_active_buffer,
+    set_active_buffer,
+    target_dim,
+)
+from thought_recorder import (
+    install as install_recorder,
+)
+from thought_recorder import (
+    is_installed as is_recorder_installed,
+)
 from thought_wrap import (
     clear_request_seed,
     delta_net_layers,
@@ -117,13 +129,63 @@ class CompletionRequest(BaseModel):
 # model loading
 # --------------------------------------------------------------------------- #
 def load_real(weights: str, device: str):
-    from transformers import AutoTokenizer
-    from transformers.models.qwen3_5 import Qwen3_5ForCausalLM
+    """Load the checkpoint, auto-detecting the model family.
 
-    tok = AutoTokenizer.from_pretrained(weights)
-    lm = Qwen3_5ForCausalLM.from_pretrained(weights, torch_dtype=torch.bfloat16)
-    lm = lm.to(device).eval()
-    return lm, tok
+    Prefer the **text CausalLM** class so we don't load a vision tower we
+    don't need — this is what kept the 4B inside a 12 GB card. Fall back to
+    the multimodal ``…ForConditionalGeneration`` class only when the CausalLM
+    class can't load that checkpoint (e.g. the VL-MoE Qwen3.5-35B-A3B, which
+    has no standalone CausalLM entry).
+
+    Always returns ``(model, tokenizer)`` where ``tokenizer`` supports
+    ``apply_chat_template``.
+    """
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    try:
+        from transformers import AutoModelForImageTextToText, AutoProcessor
+    except ImportError:  # older transformers
+        AutoModelForImageTextToText = AutoProcessor = None
+
+    kw = dict(torch_dtype=torch.bfloat16, low_cpu_mem_usage=True)
+    errors = []
+
+    # 1) text CausalLM — the 4B path (and the 35B-A3B text stack if that
+    #    model_type is registered here). No vision tower.
+    try:
+        lm = AutoModelForCausalLM.from_pretrained(weights, **kw)
+        return lm.to(device).eval(), AutoTokenizer.from_pretrained(weights)
+    except Exception as e:  # noqa: BLE001 - try the next class
+        errors.append(("CausalLM", repr(e)))
+
+    # 2) multimodal VL-MoE (Qwen3.5-35B-A3B is Qwen3_5MoeForConditionalGeneration)
+    if AutoModelForImageTextToText is not None:
+        try:
+            lm = AutoModelForImageTextToText.from_pretrained(weights, **kw)
+            return lm.to(device).eval(), AutoProcessor.from_pretrained(
+                weights
+            ).tokenizer
+        except Exception as e:  # noqa: BLE001
+            errors.append(("image-text-to-text", repr(e)))
+
+    # 3) last resort: the original 4B class, exactly as before
+    try:
+        from transformers.models.qwen3_5 import Qwen3_5ForCausalLM
+
+        lm = Qwen3_5ForCausalLM.from_pretrained(weights, **kw)
+        return lm.to(device).eval(), AutoTokenizer.from_pretrained(weights)
+    except Exception as e:  # noqa: BLE001
+        errors.append(("Qwen3_5ForCausalLM", repr(e)))
+
+    raise RuntimeError(f"could not load {weights}: {errors}")
+
+
+def safe_pad_id(tok):
+    """A usable pad id (VL tokenizers may not define one)."""
+    pid = getattr(tok, "pad_token_id", None)
+    if pid is None:
+        pid = getattr(tok, "eos_token_id", None)
+    return pid
 
 
 def strip_thinking(text: str) -> str:
@@ -165,6 +227,7 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8100)
     ap.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
     ap.add_argument("--weights", default="models/Qwen3.5-4B")
+    ap.add_argument("--model-id", default="qwen3.5-4b-simplex")
     ap.add_argument("--max-tokens-default", type=int, default=256)
     ap.add_argument(
         "--enable-thinking",
@@ -176,12 +239,15 @@ def main() -> None:
     ap.add_argument("--thought-seed", type=int, default=42)
     ap.add_argument("--gain", type=float, default=1.0)
     args = ap.parse_args()
+    global MODEL_ID
+    MODEL_ID = args.model_id
 
     t0 = time.time()
     lm, tok = load_real(args.weights, args.device)
     n_layers = len(delta_net_layers(lm))
     if args.thought_enabled:
         wrap(lm, args.thought_seed, args.gain, args.gain)
+        install_recorder(lm)
     print(
         f"loaded {args.weights} ({time.time() - t0:.0f}s) | {n_layers} GatedDeltaNet layers | "
         f"thought={'ON (gain %.1f, seed %d)' % (args.gain, args.thought_seed) if args.thought_enabled else 'OFF (vanilla)'} | "
@@ -212,11 +278,14 @@ def main() -> None:
             )
 
     def thought_meta():
+        on = args.thought_enabled and is_wrapped(lm)
         return {
-            "enabled": args.thought_enabled and is_wrapped(lm),
+            "enabled": on,
             "default_seed": args.thought_seed,
             "gain": args.gain if args.thought_enabled else None,
             "wrapped_layers": n_wrapped(lm),
+            "trajectory_enabled": bool(on and is_recorder_installed(lm)),
+            "dim": target_dim(lm) if on else None,
         }
 
     @app.get("/health")
@@ -246,7 +315,15 @@ def main() -> None:
         top_p: Optional[float],
         top_k: Optional[int],
         seed: Optional[int] = None,
-    ) -> str:
+    ):
+        """Return ``(text, trajectory)``; trajectory is the p_t thought wave."""
+        buf = (
+            TrajectoryBuffer(target_dim(lm))
+            if (args.thought_enabled and is_wrapped(lm))
+            else None
+        )
+        if buf is not None:
+            set_active_buffer(buf)
         if seed is not None:
             set_request_seed(seed)
         try:
@@ -257,7 +334,7 @@ def main() -> None:
                 max_new_tokens=max_tokens,
                 do_sample=do_sample,
                 temperature=temperature if do_sample else 1.0,
-                pad_token_id=tok.pad_token_id,
+                pad_token_id=safe_pad_id(tok),
             )
             if top_p is not None:
                 kwargs["top_p"] = top_p
@@ -268,9 +345,13 @@ def main() -> None:
         finally:
             if seed is not None:
                 clear_request_seed()
+            if buf is not None:
+                clear_active_buffer()
         new = out[0][ids.shape[1] :]
         text = tok.decode(new, skip_special_tokens=True)
-        return text if args.enable_thinking else strip_thinking(text)
+        text = text if args.enable_thinking else strip_thinking(text)
+        trajectory = buf.snapshot() if buf is not None else None
+        return text, trajectory
 
     def _sse(payload: dict) -> str:
         return "data: " + json.dumps(payload) + "\n\n"
@@ -291,6 +372,11 @@ def main() -> None:
         """
         from transformers import TextIteratorStreamer
 
+        buf = (
+            TrajectoryBuffer(target_dim(lm))
+            if (args.thought_enabled and is_wrapped(lm))
+            else None
+        )
         streamer = TextIteratorStreamer(tok, timeout=300, skip_special_tokens=True)
         ids = torch.tensor([input_ids], dtype=torch.long, device=args.device)
         do_sample = temperature > 0
@@ -299,7 +385,7 @@ def main() -> None:
             max_new_tokens=max_tokens,
             do_sample=do_sample,
             temperature=temperature if do_sample else 1.0,
-            pad_token_id=tok.pad_token_id,
+            pad_token_id=safe_pad_id(tok),
             streamer=streamer,
         )
         if top_p is not None:
@@ -310,12 +396,16 @@ def main() -> None:
         def _run():
             if seed is not None:
                 set_request_seed(seed)
+            if buf is not None:
+                set_active_buffer(buf)
             try:
                 with torch.inference_mode():
                     lm.generate(**gk)
             finally:
                 if seed is not None:
                     clear_request_seed()
+                if buf is not None:
+                    clear_active_buffer()
 
         thread = threading.Thread(target=_run, daemon=True)
         thread.start()
@@ -333,13 +423,31 @@ def main() -> None:
                 }
             )
 
-        close_tag = "\u003c" + "/think" + "\u003e"
+        close_tag = "<" + "/think" + ">"
         passed = args.enable_thinking  # when thinking is on, pass everything through
         hold = ""
         MAX_HOLD = 1000
+
+        def _thought():
+            """Flush any p_t coords captured so far as an SSE 'thought' chunk."""
+            if buf is None:
+                return
+            pts = buf.drain()
+            if pts:
+                yield _sse(
+                    {
+                        "id": cid,
+                        "object": "chat.completion.chunk",
+                        "type": "thought",
+                        "points": pts,
+                        "dim": target_dim(lm),
+                    }
+                )
+
         try:
             yield chunk({"role": "assistant", "content": ""})
             for text in streamer:
+                yield from _thought()
                 if not text:
                     continue
                 if not passed:
@@ -358,6 +466,7 @@ def main() -> None:
                     # else: still inside a thinking block - keep holding
                 else:
                     yield chunk({"content": text})
+            yield from _thought()
             if hold:
                 yield chunk({"content": hold})
         finally:
@@ -390,7 +499,7 @@ def main() -> None:
 
             return StreamingResponse(_gen(), media_type="text/event-stream")
 
-        text = _generate(
+        text, trajectory = _generate(
             ids,
             req.max_tokens,
             req.temperature,
@@ -416,7 +525,12 @@ def main() -> None:
                 "completion_tokens": comp_tokens,
                 "total_tokens": prompt_tokens + comp_tokens,
             },
-            "thought": {"enabled": bool(active_seed is not None), "seed": active_seed},
+            "thought": {
+                "enabled": bool(active_seed is not None),
+                "seed": active_seed,
+                "trajectory": trajectory,
+                "dim": target_dim(lm) if trajectory else None,
+            },
         }
 
     @app.post("/v1/completions")
@@ -430,7 +544,7 @@ def main() -> None:
             [ChatMessage(role="user", content=req.prompt)]
         )
         prompt_tokens = len(ids)
-        text = _generate(
+        text, trajectory = _generate(
             ids,
             req.max_tokens,
             req.temperature,
@@ -448,7 +562,12 @@ def main() -> None:
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": len(tok(text)["input_ids"]) if text else 0,
             },
-            "thought": {"enabled": bool(active_seed is not None), "seed": active_seed},
+            "thought": {
+                "enabled": bool(active_seed is not None),
+                "seed": active_seed,
+                "trajectory": trajectory,
+                "dim": target_dim(lm) if trajectory else None,
+            },
         }
 
     print(f"chat endpoint ready on http://{args.host}:{args.port}/v1/chat/completions")

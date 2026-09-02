@@ -40,12 +40,39 @@ __all__ = [
 ]
 
 
+def _decoder_layer_stack(lm) -> list:
+    """Locate the text decoder ``layers`` list across model wrappers.
+
+    Works for both a plain CausalLM (``lm.model.layers``) and a VL/MoE
+    conditional-generation model where the text stack sits one level down
+    (``lm.model.language_model.layers``). Returns the first ``layers`` list
+    that actually contains GatedDeltaNet (``linear_attn``) layers.
+    """
+    roots = [
+        lm,
+        getattr(lm, "model", None),
+        getattr(getattr(lm, "model", None), "language_model", None),
+        getattr(lm, "language_model", None),
+    ]
+    for root in roots:
+        if root is None:
+            continue
+        layers = getattr(root, "layers", None)
+        if layers is None:
+            continue
+        try:
+            if any(getattr(l, "linear_attn", None) is not None for l in layers):
+                return list(layers)
+        except TypeError:
+            continue
+    return []
+
+
 def delta_net_layers(lm) -> List[Tuple[int, object]]:
     """``(layer_index, decoder_layer)`` for every GatedDeltaNet layer."""
-    layers = lm.model.layers
     return [
         (i, l)
-        for i, l in enumerate(layers)
+        for i, l in enumerate(_decoder_layer_stack(lm))
         if getattr(l, "linear_attn", None) is not None
     ]
 

@@ -95,6 +95,139 @@
                 border-radius: 6px;
                 padding: 4px 8px;
             }
+            #viz {
+                width: 100%;
+                max-width: 852px;
+                margin: 0 auto;
+                background: var(--panel);
+                border-bottom: 1px solid var(--border);
+                transition: opacity 0.2s ease;
+            }
+            #viz.off {
+                opacity: 0.55;
+            }
+            #viz-bar {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 10px;
+                padding: 8px 16px;
+            }
+            #viz:not(.collapsed) #viz-bar {
+                border-bottom: 1px solid var(--border);
+            }
+            #viz .viz-title {
+                font-size: 12px;
+                font-weight: 600;
+                color: var(--text);
+                letter-spacing: 0.01em;
+            }
+            #viz .viz-title code {
+                color: var(--accent);
+                font-weight: 600;
+            }
+            #viz-toggle {
+                background: var(--bg);
+                color: var(--text);
+                border: 1px solid var(--border);
+                border-radius: 6px;
+                padding: 3px 10px;
+                font: 12px system-ui;
+                cursor: pointer;
+                flex: none;
+            }
+            #viz-toggle:hover {
+                filter: brightness(1.15);
+            }
+            #viz-body {
+                display: flex;
+                gap: 14px;
+                align-items: stretch;
+                padding: 10px 16px 12px;
+            }
+            #viz.collapsed #viz-body {
+                display: none;
+            }
+            #viz .stage {
+                position: relative;
+                flex: none;
+            }
+            #viz-canvas {
+                width: 220px;
+                height: 220px;
+                display: block;
+                background: radial-gradient(
+                    circle at 50% 45%,
+                    #141821 0%,
+                    #0b0d11 100%
+                );
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                cursor: grab;
+                touch-action: none;
+            }
+            #viz .readout {
+                flex: 1;
+                min-width: 220px;
+                display: flex;
+                flex-direction: column;
+                justify-content: center;
+                gap: 9px;
+                font-size: 12.5px;
+                color: var(--muted);
+            }
+            #viz .readout .title {
+                font-size: 12px;
+                font-weight: 600;
+                color: var(--text);
+                letter-spacing: 0.01em;
+            }
+            #viz .readout .title code {
+                color: var(--accent);
+                font-weight: 600;
+            }
+            #viz .streams {
+                display: flex;
+                flex-direction: column;
+                gap: 5px;
+            }
+            #viz .streamrow {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                font-variant-numeric: tabular-nums;
+                white-space: nowrap;
+            }
+            #viz .streamrow .sw {
+                width: 11px;
+                height: 11px;
+                border-radius: 3px;
+                flex: none;
+            }
+            #viz .streamrow .lab {
+                color: var(--text);
+                min-width: 62px;
+            }
+            #viz .readout .note {
+                color: var(--muted);
+                font-size: 11.5px;
+            }
+            #viz .tools {
+                display: flex;
+                gap: 6px;
+            }
+            #viz .tools button {
+                background: var(--bg);
+                color: var(--text);
+                border: 1px solid var(--border);
+                border-radius: 6px;
+                padding: 3px 9px;
+                font: 12px system-ui;
+                cursor: pointer;
+            }
+            #viz .tools button:hover {
+                filter: brightness(1.15);
+            }
             main {
                 flex: 1;
                 overflow-y: auto;
@@ -215,6 +348,19 @@
                 text-align: center;
                 padding: 0 16px 8px;
             }
+            @media (max-width: 640px) {
+                #viz-body {
+                    flex-direction: column;
+                    align-items: center;
+                }
+                #viz-canvas {
+                    width: 100%;
+                    height: 200px;
+                }
+                #viz .readout {
+                    min-width: 0;
+                }
+            }
         </style>
     </head>
     <body>
@@ -235,13 +381,39 @@
             </div>
         </header>
 
+        <section id="viz" class="off">
+            <div id="viz-bar">
+                <span class="viz-title"
+                    >thought wave · <code>p_t = M·h_t + drift·t</code></span
+                >
+                <button id="viz-toggle" type="button">▾ collapse</button>
+            </div>
+            <div id="viz-body">
+                <div class="stage">
+                    <canvas id="viz-canvas" width="220" height="220"></canvas>
+                </div>
+                <div class="readout">
+                    <div class="streams" id="viz-streams"></div>
+                    <div class="note" id="viz-note">
+                        waiting for a generation…
+                    </div>
+                    <div class="tools">
+                        <button id="viz-spin">spin: on</button>
+                        <button id="viz-reset">reset view</button>
+                    </div>
+                </div>
+            </div>
+        </section>
+
         <main id="chat">
             <div class="msg model">
                 <div class="who">simplex</div>
                 Hi. I'm the Qwen3.5-4B with the Simplex Thought Field wrapped
                 in. Plain <b>Send</b> is a normal reply; <b>A/B</b> answers the
                 same message under two different thought seeds so you can see
-                the seed steer the choice.
+                the seed steer the choice. The panel above plots the model's 3-D
+                field coordinates <b>p_t</b> as they modulate — watch the wave
+                extend token by token (and split into two for A/B).
             </div>
         </main>
 
@@ -278,6 +450,293 @@
                 d.textContent = s;
                 return d.innerHTML;
             }
+
+            // ------------------------------------------------------------------
+            // 3-D "thought wave" visualizer: plots the field coordinate p_t
+            // (the model's latent -> field drift) as it streams in.  Zero
+            // dependencies — a hand-rolled orthographic 3D->2D projection on
+            // canvas, so the page stays fully offline/self-contained.
+            // ------------------------------------------------------------------
+            const Viz = {
+                canvas: null,
+                ctx: null,
+                W: 220,
+                H: 220,
+                streams: [], // [{label, color, points:[[x,y,z],...]}]
+                angleX: -0.5,
+                angleY: 0.75,
+                spin: true,
+                dirty: true,
+                ZOOM: 0.82,
+
+                init() {
+                    this.canvas = $("viz-canvas");
+                    this.ctx = this.canvas.getContext("2d");
+                    this.resize();
+                    const c = this.canvas;
+                    let dragging = false,
+                        px = 0,
+                        py = 0;
+                    c.addEventListener("pointerdown", (e) => {
+                        dragging = true;
+                        px = e.clientX;
+                        py = e.clientY;
+                        this.spin = false;
+                        this.syncSpinBtn();
+                        c.setPointerCapture(e.pointerId);
+                        c.style.cursor = "grabbing";
+                    });
+                    c.addEventListener("pointermove", (e) => {
+                        if (!dragging) return;
+                        this.angleY += (e.clientX - px) * 0.012;
+                        this.angleX += (e.clientY - py) * 0.012;
+                        px = e.clientX;
+                        py = e.clientY;
+                        this.dirty = true;
+                    });
+                    const up = () => {
+                        dragging = false;
+                        c.style.cursor = "grab";
+                    };
+                    c.addEventListener("pointerup", up);
+                    c.addEventListener("pointercancel", up);
+                    $("viz-spin").addEventListener("click", () => {
+                        this.spin = !this.spin;
+                        this.syncSpinBtn();
+                    });
+                    $("viz-reset").addEventListener("click", () => {
+                        this.angleX = -0.5;
+                        this.angleY = 0.75;
+                        this.spin = true;
+                        this.syncSpinBtn();
+                        this.dirty = true;
+                    });
+                    window.addEventListener("resize", () => this.resize());
+                    this.loop();
+                },
+                syncSpinBtn() {
+                    $("viz-spin").textContent =
+                        "spin: " + (this.spin ? "on" : "off");
+                },
+                resize() {
+                    const dpr = window.devicePixelRatio || 1;
+                    const cssW = this.canvas.clientWidth || 220;
+                    const cssH = this.canvas.clientHeight || 220;
+                    this.canvas.width = Math.round(cssW * dpr);
+                    this.canvas.height = Math.round(cssH * dpr);
+                    this.W = cssW;
+                    this.H = cssH;
+                    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+                    this.dirty = true;
+                },
+                setEnabled(state) {
+                    $("viz").classList.toggle("off", !state);
+                },
+                reset(spec) {
+                    this.streams = spec.map((s) => ({
+                        label: s.label,
+                        color: s.color,
+                        points: [],
+                    }));
+                    this.dirty = true;
+                    this.renderStreamsList();
+                },
+                push(label, flat, dim) {
+                    const s = this.streams.find((x) => x.label === label);
+                    if (!s || !flat || !flat.length) return;
+                    dim = dim || 3;
+                    for (let i = 0; i + dim <= flat.length; i += dim) {
+                        if (dim >= 3)
+                            s.points.push([flat[i], flat[i + 1], flat[i + 2]]);
+                        else s.points.push([flat[i], flat[i + 1], 0]);
+                    }
+                    this.dirty = true;
+                    this.renderStreamsList();
+                },
+                renderStreamsList() {
+                    const box = $("viz-streams");
+                    const note = $("viz-note");
+                    box.innerHTML = "";
+                    if (!this.streams.length) {
+                        note.textContent = "waiting for a generation…";
+                        return;
+                    }
+                    let maxT = 0;
+                    for (const s of this.streams) {
+                        const t = s.points.length;
+                        maxT = Math.max(maxT, t);
+                        const last = t ? s.points[t - 1] : null;
+                        const f = (n) => (n >= 0 ? "+" : "") + n.toFixed(2);
+                        const row = document.createElement("div");
+                        row.className = "streamrow";
+                        row.innerHTML =
+                            '<span class="sw" style="background:' +
+                            s.color +
+                            '"></span>' +
+                            '<span class="lab">' +
+                            esc(s.label) +
+                            "</span>" +
+                            "<span>t=" +
+                            t +
+                            "</span>" +
+                            (last
+                                ? "<span>p=(" +
+                                  f(last[0]) +
+                                  ", " +
+                                  f(last[1]) +
+                                  ", " +
+                                  f(last[2]) +
+                                  ")</span>"
+                                : "<span>—</span>");
+                        box.appendChild(row);
+                    }
+                    note.textContent =
+                        maxT > 0
+                            ? "watching the wave · drag to rotate · " +
+                              maxT +
+                              " field steps"
+                            : "waiting for a generation…";
+                },
+                project(p, cx, cy, scale) {
+                    const x = p[0],
+                        y = p[1],
+                        z = p[2];
+                    const ay = this.angleY,
+                        ax = this.angleX;
+                    const X = x * Math.cos(ay) + z * Math.sin(ay);
+                    const Z = -x * Math.sin(ay) + z * Math.cos(ay);
+                    const Y = y * Math.cos(ax) - Z * Math.sin(ax);
+                    return [cx + X * scale, cy - Y * scale];
+                },
+                hexA(hex, a) {
+                    const h = hex.replace("#", "");
+                    const r = parseInt(h.slice(0, 2), 16),
+                        g = parseInt(h.slice(2, 4), 16),
+                        b = parseInt(h.slice(4, 6), 16);
+                    return "rgba(" + r + "," + g + "," + b + "," + a + ")";
+                },
+                dot(x, y, color, r) {
+                    const ctx = this.ctx;
+                    ctx.save();
+                    ctx.shadowColor = color;
+                    ctx.shadowBlur = 10;
+                    ctx.fillStyle = color;
+                    ctx.beginPath();
+                    ctx.arc(x, y, r, 0, Math.PI * 2);
+                    ctx.fill();
+                    ctx.restore();
+                },
+                render() {
+                    const ctx = this.ctx,
+                        W = this.W,
+                        H = this.H;
+                    ctx.clearRect(0, 0, W, H);
+                    const cx = W / 2,
+                        cy = H / 2;
+                    let all = [];
+                    for (const s of this.streams)
+                        for (const p of s.points) all.push(p);
+                    if (!all.length) {
+                        ctx.fillStyle = "rgba(139,147,163,0.65)";
+                        ctx.font = "12px system-ui";
+                        ctx.textAlign = "center";
+                        ctx.fillText("thought field: waiting…", cx, cy - 4);
+                        ctx.fillText("send a message to plot p_t", cx, cy + 12);
+                        ctx.textAlign = "left";
+                        return;
+                    }
+                    const min = [Infinity, Infinity, Infinity],
+                        max = [-Infinity, -Infinity, -Infinity];
+                    for (const p of all)
+                        for (let k = 0; k < 3; k++) {
+                            if (p[k] < min[k]) min[k] = p[k];
+                            if (p[k] > max[k]) max[k] = p[k];
+                        }
+                    const ext = [
+                        Math.max(1e-6, max[0] - min[0]),
+                        Math.max(1e-6, max[1] - min[1]),
+                        Math.max(1e-6, max[2] - min[2]),
+                    ];
+                    const scale =
+                        (Math.min(W, H) * this.ZOOM) /
+                        Math.max(ext[0], ext[1], ext[2]);
+                    const center = [
+                        (min[0] + max[0]) / 2,
+                        (min[1] + max[1]) / 2,
+                        (min[2] + max[2]) / 2,
+                    ];
+                    const proj = (p) =>
+                        this.project(
+                            [
+                                p[0] - center[0],
+                                p[1] - center[1],
+                                p[2] - center[2],
+                            ],
+                            cx,
+                            cy,
+                            scale,
+                        );
+                    // orientation axes from the cloud center
+                    const L = 24 / scale;
+                    const axes = [
+                        [[L, 0, 0], "#e05252", "X"],
+                        [[0, L, 0], "#38c172", "Y"],
+                        [[0, 0, L], "#4f8cff", "Z"],
+                    ];
+                    for (const [v, col, lab] of axes) {
+                        const b = proj(v);
+                        ctx.strokeStyle = col;
+                        ctx.lineWidth = 1.4;
+                        ctx.beginPath();
+                        ctx.moveTo(cx, cy);
+                        ctx.lineTo(b[0], b[1]);
+                        ctx.stroke();
+                        ctx.fillStyle = col;
+                        ctx.font = "10px system-ui";
+                        ctx.fillText(lab, b[0] + 3, b[1] + 3);
+                    }
+                    // each stream: fading tail + bright head
+                    for (const s of this.streams) {
+                        const pts = s.points;
+                        if (!pts.length) continue;
+                        if (pts.length === 1) {
+                            const q = proj(pts[0]);
+                            this.dot(q[0], q[1], s.color, 4);
+                            continue;
+                        }
+                        for (let i = 1; i < pts.length; i++) {
+                            const a = proj(pts[i - 1]),
+                                b = proj(pts[i]);
+                            const tt = i / pts.length;
+                            ctx.strokeStyle = this.hexA(
+                                s.color,
+                                0.1 + 0.9 * tt,
+                            );
+                            ctx.lineWidth = 1 + 1.6 * tt;
+                            ctx.beginPath();
+                            ctx.moveTo(a[0], a[1]);
+                            ctx.lineTo(b[0], b[1]);
+                            ctx.stroke();
+                        }
+                        const head = proj(pts[pts.length - 1]);
+                        this.dot(head[0], head[1], s.color, 4.5);
+                    }
+                },
+                loop() {
+                    const step = () => {
+                        if (this.spin) {
+                            this.angleY += 0.006;
+                            this.dirty = true;
+                        }
+                        if (this.dirty) {
+                            this.render();
+                            this.dirty = false;
+                        }
+                        requestAnimationFrame(step);
+                    };
+                    requestAnimationFrame(step);
+                },
+            };
 
             function addMsg(role, text, label) {
                 const el = document.createElement("div");
@@ -322,16 +781,19 @@
                         ? `thought: on (${h.wrapped_layers} layers, gain ${h.gain}, seed ${h.default_seed})`
                         : "thought: off (vanilla)";
                     badge.className = "badge" + (on ? " on" : "");
+                    Viz.setEnabled(on);
                 } catch (e) {
                     dot.className = "dot err";
                     txt.textContent = "endpoint unreachable at " + API;
                     badge.textContent = "thought: —";
+                    Viz.setEnabled(false);
                 }
             }
 
             // Shared SSE reader: POSTs a streaming chat completion, feeds
-            // onDelta(fullText) as tokens arrive, resolves to the full text.
-            async function streamChat(messages, extra, onDelta) {
+            // onDelta(fullText) as tokens arrive and onThought(points,dim) as
+            // field coordinates stream in; resolves to the full text.
+            async function streamChat(messages, extra, onDelta, onThought) {
                 const body = Object.assign(
                     {
                         messages: messages,
@@ -371,6 +833,10 @@
                         } catch (e) {
                             continue;
                         }
+                        if (j && j.type === "thought") {
+                            if (onThought) onThought(j.points, j.dim);
+                            continue;
+                        }
                         const delta =
                             j.choices && j.choices[0] && j.choices[0].delta;
                         if (delta && delta.content) {
@@ -390,6 +856,7 @@
                 history.push({ role: "user", content: text });
                 addMsg("user", text);
                 setBusy(true);
+                Viz.reset([{ label: "default", color: "#4f8cff" }]);
                 // growing assistant bubble
                 const el = document.createElement("div");
                 el.className = "msg model";
@@ -402,10 +869,15 @@
                 chat.appendChild(el);
                 let full = "";
                 try {
-                    full = await streamChat(history, {}, (f) => {
-                        bodyNode.textContent = f;
-                        chat.scrollTop = chat.scrollHeight;
-                    });
+                    full = await streamChat(
+                        history,
+                        {},
+                        (f) => {
+                            bodyNode.textContent = f;
+                            chat.scrollTop = chat.scrollHeight;
+                        },
+                        (flat, dim) => Viz.push("default", flat, dim),
+                    );
                     history.push({ role: "assistant", content: full });
                 } catch (e) {
                     if (full) {
@@ -436,6 +908,11 @@
                 history.push({ role: "user", content: text });
                 addMsg("user", text);
                 setBusy(true);
+                // one wave per seed, overlaid in the 3-D plot
+                Viz.reset([
+                    { label: "seed " + seedA, color: "#4f8cff" },
+                    { label: "seed " + seedB, color: "#9a6bff" },
+                ]);
                 // build both panes up front — they stream live, in parallel
                 const wrap = document.createElement("div");
                 wrap.className = "ab";
@@ -460,17 +937,21 @@
                     bodies[cls].text = f;
                     chat.scrollTop = chat.scrollHeight;
                 };
+                const wave = (seed) => (flat, dim) =>
+                    Viz.push("seed " + seed, flat, dim);
                 try {
                     const [a, b] = await Promise.all([
                         streamChat(
                             history,
                             { thought_seed: seedA },
                             live("seed-a"),
+                            wave(seedA),
                         ),
                         streamChat(
                             history,
                             { thought_seed: seedB },
                             live("seed-b"),
+                            wave(seedB),
                         ),
                     ]);
                     bodies["seed-a"].tag.textContent = "thought seed " + seedA;
@@ -505,6 +986,31 @@
                 }
             });
 
+            // collapsible panel (state persists across reloads)
+            const vizEl = $("viz");
+            const vizToggle = $("viz-toggle");
+            function setVizCollapsed(c) {
+                vizEl.classList.toggle("collapsed", c);
+                vizToggle.textContent = c ? "▸ expand" : "▾ collapse";
+                try {
+                    localStorage.setItem(
+                        "simplex-viz-collapsed",
+                        c ? "1" : "0",
+                    );
+                } catch (e) {}
+                if (!c && Viz.canvas) Viz.resize();
+            }
+            vizToggle.addEventListener("click", () =>
+                setVizCollapsed(!vizEl.classList.contains("collapsed")),
+            );
+            Viz.init();
+            let startCollapsed = false;
+            try {
+                startCollapsed =
+                    localStorage.getItem("simplex-viz-collapsed") === "1";
+            } catch (e) {}
+            setVizCollapsed(startCollapsed);
+            Viz.reset([{ label: "default", color: "#4f8cff" }]);
             health();
             setInterval(health, 15000);
             input.focus();
