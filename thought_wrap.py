@@ -34,6 +34,8 @@ __all__ = [
     "set_seed",
     "is_wrapped",
     "n_wrapped",
+    "set_mix",
+    "clear_mix",
     "set_request_seed",
     "clear_request_seed",
     "request_seed",
@@ -140,3 +142,24 @@ def set_seed(lm, seed: int) -> None:
         attn = layer.linear_attn
         if hasattr(attn, "thought"):
             attn.thought.set_seed(seed)
+
+
+def set_mix(lm, offset, alpha: float) -> None:
+    """Blend a second branch pattern (raw offset) into every wrapped layer.
+
+    ``alpha = 0`` turns blending off; ``alpha = 1`` is fully the other
+    branch's pattern. The primary (seed) pattern stays in effect, so this
+    is a smooth α-dial between the two branches.
+    """
+    for _, layer in delta_net_layers(lm):
+        attn = layer.linear_attn
+        if hasattr(attn, "thought"):
+            attn.thought.set_mix(offset, alpha)
+
+
+def clear_mix(lm) -> None:
+    """Disable branch blending on every wrapped layer."""
+    for _, layer in delta_net_layers(lm):
+        attn = layer.linear_attn
+        if hasattr(attn, "thought"):
+            attn.thought.clear_mix()

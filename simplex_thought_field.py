@@ -329,21 +329,31 @@ class SimplexField(nn.Module):
         gen.manual_seed(int(seed))
         return torch.rand(dim, generator=gen) * 64.0 - 32.0
 
-    def forward(self, coords: torch.Tensor, seed: Optional[int] = None) -> torch.Tensor:
+    def forward(
+        self,
+        coords: torch.Tensor,
+        seed: Optional[int] = None,
+        offset: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """``coords: (..., dim) -> (...,)``.
 
         ``seed`` optionally overrides the field's own seed for this
         evaluation only (per-request steering without mutating shared
         state). With ``seed=None`` the registered ``seed_offset`` buffer
         is used, exactly as before.
+
+        ``offset`` (highest priority) directly specifies the coordinate
+        offset — used for branch blending, where the target pattern is a
+        raw offset rather than a seed-derivable one.
         """
-        offset = (
-            self.seed_offset
-            if seed is None
-            else self._make_seed_offset(seed, self.dim).to(
+        if offset is None and seed is None:
+            offset = self.seed_offset
+        elif offset is None:
+            offset = self._make_seed_offset(seed, self.dim).to(
                 self.seed_offset.device, self.seed_offset.dtype
             )
-        )
+        else:
+            offset = offset.to(self.seed_offset.device, self.seed_offset.dtype)
         out: Optional[torch.Tensor] = None
         amp = 1.0
         for o in range(self.octaves):
@@ -376,12 +386,14 @@ def _b64_to_tensor(d: Dict[str, object]) -> torch.Tensor:
 
 
 def _fingerprint(coords: torch.Tensor, slot_values: Dict[str, torch.Tensor]) -> str:
+    # hash through float32 — numpy has no bfloat16 representation, and this
+    # keeps the fingerprint stable regardless of the model's compute dtype
     h = hashlib.sha256()
-    h.update(coords.detach().contiguous().cpu().numpy().tobytes())
+    h.update(coords.detach().contiguous().cpu().to(torch.float32).numpy().tobytes())
     for k in sorted(slot_values):
         v = slot_values[k]
         h.update(k.encode("utf-8"))
-        h.update(v.detach().contiguous().cpu().numpy().tobytes())
+        h.update(v.detach().contiguous().cpu().to(torch.float32).numpy().tobytes())
     return h.hexdigest()[:32]
 
 
@@ -525,6 +537,12 @@ class ThoughtModulator(nn.Module):
         self._last_coords: Optional[torch.Tensor] = None
         self._last_slot_values: Dict[str, torch.Tensor] = {}
 
+        # Branch blending (see :meth:`set_mix`): mix in a second field
+        # pattern so ``bias = (1-α)·field(seed) + α·field(mix_offset)``.
+        # Off by default (α = 0) — zero cost when unused.
+        self.mix_offset: Optional[torch.Tensor] = None
+        self.mix_alpha: float = 0.0
+
     # -- internals ----------------------------------------------------------
 
     def _coords_for(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -559,7 +577,14 @@ class ThoughtModulator(nn.Module):
         # otherwise fall back to this modulator's own seed.  Stateless:
         # no shared buffer is mutated, so concurrent requests are isolated.
         seed = request_seed(self.seed)
-        vals = self.field(p.unsqueeze(2) + off.unsqueeze(0).unsqueeze(0), seed=seed)
+        q = p.unsqueeze(2) + off.unsqueeze(0).unsqueeze(0)
+        vals = self.field(q, seed=seed)
+        # Optional branch blending: a smooth α-dial between this branch's
+        # pattern and another branch's raw offset pattern.
+        if self.mix_alpha > 0.0 and self.mix_offset is not None:
+            vals = (1.0 - self.mix_alpha) * vals + self.mix_alpha * self.field(
+                q, offset=self.mix_offset
+            )
         self._last_coords = p.detach()
         self._last_slot_values[slot] = vals.detach()
         gain = self.gain_b if slot == "b" else self.gain_a
@@ -574,6 +599,26 @@ class ThoughtModulator(nn.Module):
         """
         self.seed = int(seed)
         self.field.seed_offset.copy_(SimplexField._make_seed_offset(seed, self.dim))
+
+    def set_mix(self, offset: torch.Tensor, alpha: float) -> None:
+        """Enable branch blending with another branch's raw offset pattern.
+
+        ``bias = (1 - alpha) * field(seed) + alpha * field(offset)``.
+        ``alpha = 0`` disables blending (default). Thread-local request
+        seeds still select the primary pattern; the mixed pattern is fixed
+        per modulator.
+        """
+        self.mix_alpha = float(alpha)
+        if alpha <= 0.0:
+            self.mix_offset = None
+            return
+        ref = self.field.seed_offset
+        self.mix_offset = offset.to(ref.device, ref.dtype).clone()
+
+    def clear_mix(self) -> None:
+        """Disable branch blending (back to the plain seed pattern)."""
+        self.mix_alpha = 0.0
+        self.mix_offset = None
 
     def replay_slot(
         self, coords: torch.Tensor, slot: str, seed: Optional[int] = None
