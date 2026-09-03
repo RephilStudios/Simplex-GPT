@@ -53,7 +53,7 @@ import json
 import math
 import threading
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -97,6 +97,34 @@ def request_seed(default: Optional[int] = None) -> Optional[int]:
     """The current thread's request seed, or ``default`` if none is set."""
     s = getattr(_seed_tls, "seed", None)
     return int(s) if s is not None else default
+
+
+# Branch blending is the same story, per thread: each request can blend a
+# second branch pattern into the primary one without touching shared state.
+_mix_tls = threading.local()
+
+
+def set_request_mix(offset, alpha: float) -> None:
+    """Set the thread-local branch blend (second-branch offset + weight)."""
+    _mix_tls.offset = offset
+    _mix_tls.alpha = float(alpha)
+
+
+def clear_request_mix() -> None:
+    """Drop the thread-local blend so the modulator's own mix is used."""
+    _mix_tls.__dict__.pop("offset", None)
+    _mix_tls.__dict__.pop("alpha", None)
+
+
+def request_mix(
+    default_alpha: float = 0.0,
+    default_offset=None,
+) -> Tuple[float, Optional[torch.Tensor]]:
+    """The current thread's blend, or the modulator defaults if none is set."""
+    a = getattr(_mix_tls, "alpha", None)
+    if a is None:
+        return float(default_alpha), default_offset
+    return float(a), getattr(_mix_tls, "offset", None)
 
 
 # ---------------------------------------------------------------------------
@@ -580,10 +608,12 @@ class ThoughtModulator(nn.Module):
         q = p.unsqueeze(2) + off.unsqueeze(0).unsqueeze(0)
         vals = self.field(q, seed=seed)
         # Optional branch blending: a smooth α-dial between this branch's
-        # pattern and another branch's raw offset pattern.
-        if self.mix_alpha > 0.0 and self.mix_offset is not None:
-            vals = (1.0 - self.mix_alpha) * vals + self.mix_alpha * self.field(
-                q, offset=self.mix_offset
+        # pattern and another branch's raw offset pattern.  Thread-local
+        # (per-request) mix wins over the modulator's own mix.
+        mix_alpha, mix_offset = request_mix(self.mix_alpha, self.mix_offset)
+        if mix_alpha > 0.0 and mix_offset is not None:
+            vals = (1.0 - mix_alpha) * vals + mix_alpha * self.field(
+                q, offset=mix_offset
             )
         self._last_coords = p.detach()
         self._last_slot_values[slot] = vals.detach()

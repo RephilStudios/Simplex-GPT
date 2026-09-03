@@ -80,10 +80,12 @@ from thought_recorder import (
     is_installed as is_recorder_installed,
 )
 from thought_wrap import (
+    clear_request_mix,
     clear_request_seed,
     delta_net_layers,
     is_wrapped,
     n_wrapped,
+    set_request_mix,
     set_request_seed,
     wrap,
 )
@@ -114,6 +116,8 @@ class ChatRequest(BaseModel):
     top_k: Optional[int] = None
     stream: bool = False
     thought_seed: Optional[int] = None
+    thought_mix_seed: Optional[int] = None
+    thought_mix_alpha: Optional[float] = None
 
 
 class CompletionRequest(BaseModel):
@@ -123,6 +127,8 @@ class CompletionRequest(BaseModel):
     top_p: Optional[float] = None
     top_k: Optional[int] = None
     thought_seed: Optional[int] = None
+    thought_mix_seed: Optional[int] = None
+    thought_mix_alpha: Optional[float] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -315,6 +321,7 @@ def main() -> None:
         top_p: Optional[float],
         top_k: Optional[int],
         seed: Optional[int] = None,
+        mix: Optional[Tuple[object, float]] = None,
     ):
         """Return ``(text, trajectory)``; trajectory is the p_t thought wave."""
         buf = (
@@ -326,6 +333,8 @@ def main() -> None:
             set_active_buffer(buf)
         if seed is not None:
             set_request_seed(seed)
+        if mix is not None:
+            set_request_mix(mix[0], mix[1])
         try:
             ids = torch.tensor([input_ids], dtype=torch.long, device=args.device)
             do_sample = temperature > 0
@@ -345,6 +354,8 @@ def main() -> None:
         finally:
             if seed is not None:
                 clear_request_seed()
+            if mix is not None:
+                clear_request_mix()
             if buf is not None:
                 clear_active_buffer()
         new = out[0][ids.shape[1] :]
@@ -363,6 +374,7 @@ def main() -> None:
         top_p: Optional[float],
         top_k: Optional[int],
         seed: Optional[int] = None,
+        mix: Optional[Tuple[object, float]] = None,
     ):
         """Yield OpenAI-format SSE chunks (streaming chat completion).
 
@@ -396,6 +408,8 @@ def main() -> None:
         def _run():
             if seed is not None:
                 set_request_seed(seed)
+            if mix is not None:
+                set_request_mix(mix[0], mix[1])
             if buf is not None:
                 set_active_buffer(buf)
             try:
@@ -404,6 +418,8 @@ def main() -> None:
             finally:
                 if seed is not None:
                     clear_request_seed()
+                if mix is not None:
+                    clear_request_mix()
                 if buf is not None:
                     clear_active_buffer()
 
@@ -474,13 +490,25 @@ def main() -> None:
         yield chunk({}, "stop")
         yield "data: [DONE]\n\n"
 
+    def _resolve_mix(mix_seed, mix_alpha):
+        """Resolve a per-request branch blend to ``(offset, alpha)`` or None."""
+        if mix_seed is None or mix_alpha is None or float(mix_alpha) <= 0.0:
+            return None
+        alpha = min(max(float(mix_alpha), 0.0), 1.0)
+        from simplex_thought_field import SimplexField
+
+        offset = SimplexField._make_seed_offset(int(mix_seed), target_dim(lm))
+        return (offset, alpha)
+
     @app.post("/v1/chat/completions")
     def chat(req: ChatRequest):
         active_seed = None
+        mix = None
         if args.thought_enabled and is_wrapped(lm):
             active_seed = (
                 req.thought_seed if req.thought_seed is not None else args.thought_seed
             )
+            mix = _resolve_mix(req.thought_mix_seed, req.thought_mix_alpha)
 
         ids = make_chat_fn(lm, tok, args.enable_thinking)(req.messages)
         prompt_tokens = len(ids)
@@ -495,6 +523,7 @@ def main() -> None:
                     req.top_p,
                     req.top_k,
                     seed=active_seed,
+                    mix=mix,
                 )
 
             return StreamingResponse(_gen(), media_type="text/event-stream")
@@ -506,6 +535,7 @@ def main() -> None:
             req.top_p,
             req.top_k,
             seed=active_seed,
+            mix=mix,
         )
         comp_tokens = len(tok(text)["input_ids"]) if text else 0
         return {
@@ -528,6 +558,8 @@ def main() -> None:
             "thought": {
                 "enabled": bool(active_seed is not None),
                 "seed": active_seed,
+                "mix_seed": req.thought_mix_seed if mix else None,
+                "mix_alpha": mix[1] if mix else None,
                 "trajectory": trajectory,
                 "dim": target_dim(lm) if trajectory else None,
             },
@@ -536,10 +568,12 @@ def main() -> None:
     @app.post("/v1/completions")
     def completions(req: CompletionRequest):
         active_seed = None
+        mix = None
         if args.thought_enabled and is_wrapped(lm):
             active_seed = (
                 req.thought_seed if req.thought_seed is not None else args.thought_seed
             )
+            mix = _resolve_mix(req.thought_mix_seed, req.thought_mix_alpha)
         ids = make_chat_fn(lm, tok, args.enable_thinking)(
             [ChatMessage(role="user", content=req.prompt)]
         )
@@ -551,6 +585,7 @@ def main() -> None:
             req.top_p,
             req.top_k,
             seed=active_seed,
+            mix=mix,
         )
         return {
             "id": "cmpl-" + uuid.uuid4().hex[:12],
@@ -565,6 +600,8 @@ def main() -> None:
             "thought": {
                 "enabled": bool(active_seed is not None),
                 "seed": active_seed,
+                "mix_seed": req.thought_mix_seed if mix else None,
+                "mix_alpha": mix[1] if mix else None,
                 "trajectory": trajectory,
                 "dim": target_dim(lm) if trajectory else None,
             },

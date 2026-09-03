@@ -22,8 +22,10 @@ from typing import List, Optional, Tuple
 from simplex_gated_delta_net import ThoughtBiasWrapper
 from simplex_thought_field import (
     ThoughtModulator,
+    clear_request_mix,
     clear_request_seed,
-    request_seed,
+    request_mix,
+    set_request_mix,
     set_request_seed,
 )
 
@@ -36,6 +38,9 @@ __all__ = [
     "n_wrapped",
     "set_mix",
     "clear_mix",
+    "set_request_mix",
+    "clear_request_mix",
+    "request_mix",
     "set_request_seed",
     "clear_request_seed",
     "request_seed",
